@@ -5,7 +5,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-void error_handling(std::string message) {
+void error_handling(char *message) {
     fputs(message, stderr);
     fputc('\n', stderr);
     exit(1);
@@ -24,7 +24,7 @@ int main(int argc, char* argv[])
     }
 
     sock = socket(PF_INET, SOCK_STREAM, 0);
-    if (serv_sock == -1) {
+    if (sock == -1) {
         error_handling("socket() error");
     }
 

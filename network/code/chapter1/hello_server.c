@@ -6,7 +6,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-void error_handling(std::string message) {
+void error_handling(char *message) {
     fputs(message, stderr);
     fputc('\n', stderr);
     exit(1);
