@@ -1,0 +1,9 @@
+<RCC>
+    <qresource prefix="/">
+        <file>main.qml</file>
+        <file>loader_test.qml</file>
+        <file>loader_focus.qml</file>
+        <file>loader_component_file.qml</file>
+        <file>dynamic_component.qml</file>
+    </qresource>
+</RCC>

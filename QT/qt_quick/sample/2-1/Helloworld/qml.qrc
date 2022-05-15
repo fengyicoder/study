@@ -1,0 +1,10 @@
+<RCC>
+    <qresource prefix="/">
+        <file>main.qml</file>
+        <file>sample1.qml</file>
+        <file>sample2.qml</file>
+        <file>sample3.qml</file>
+        <file>sample4.qml</file>
+        <file>sample5.qml</file>
+    </qresource>
+</RCC>

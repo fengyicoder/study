@@ -1,0 +1,8 @@
+<RCC>
+    <qresource prefix="/">
+        <file>main.qml</file>
+        <file>handle_mouse.qml</file>
+        <file>handle_key.qml</file>
+        <file>countdown.qml</file>
+    </qresource>
+</RCC>
