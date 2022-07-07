@@ -1,0 +1,14 @@
+<RCC>
+    <qresource prefix="/">
+        <file>main.qml</file>
+        <file>TextField.qml</file>
+        <file>TextArea.qml</file>
+        <file>preferred_mobile_os.qml</file>
+        <file>preferred_movies.qml</file>
+        <file>preferred_movies_groupbox.qml</file>
+        <file>combobox_demo.qml</file>
+        <file>progressbar_demo.qml</file>
+        <file>tabview_simple.qml</file>
+        <file>slider_demo.qml</file>
+    </qresource>
+</RCC>

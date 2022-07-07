@@ -873,7 +873,7 @@ Rectangle {
 }
 ```
 
-目前所讨论的信号都是QML已有的信号类型，大致可分为两类，一类由用户输入产生，例如按键、鼠标等，另一类由对象状态或属性变化产生，当属性变化时会自动发出一个信号，形如”<property>Changed“，它对应的信号处理器形如”on<Property>Changed“，但有一些属性变化时不会发射信号，而且有的<property>Changed信号有参数，有的没有。要想直到属性有没有与信号关联，可以先找到QML所对应的C++类型，从其声明中来确认，方法如下：
+目前所讨论的信号都是QML已有的信号类型，大致可分为两类，一类由用户输入产生，例如按键、鼠标等，另一类由对象状态或属性变化产生，当属性变化时会自动发出一个信号，形如”<property>Changed“，它对应的信号处理器形如”on<Property>Changed“，但有一些属性变化时不会发射信号，而且有的<property>Changed信号有参数，有的没有。要想知道属性有没有与信号关联，可以先找到QML所对应的C++类型，从其声明中来确认，方法如下：
 
 ```
 Rectangle {
@@ -1348,7 +1348,7 @@ Rectangle {
 
 
 
-使用Loader来动态加载QML组件，可以把Loader作为占位符使用，在需要显示某个元素时再使用Loadder将其加载进来。
+使用Loader来动态加载QML组件，可以把Loader作为占位符使用，在需要显示某个元素时再使用Loader将其加载进来。
 
 Loader可以使用source属性加载一个QML文档，也可以通过sourceComponent属性加载一个Component对象，当Loader的source或sourceComponent属性发生变化时，其之前加载的Component会自动销毁，新对象会被加载，将source设置为空字符串或sourceComponent设置为undefined时，将会销毁当前加载的对象，相关的资源也会释放而Loader对象也变成空对象。Loader的item属性指向它加载的顶层item，可通过其来访问其暴露的接口，如：
 
@@ -1374,7 +1374,7 @@ Connections {
 }
 ```
 
-虽然Loader本身是Item的派生类，但没有加载Component的Loadder对象是不可见的，只是一个占位符，但一旦加载了Component，那么Loader的位置大小会影响Component。以下是处理按键的示例：
+虽然Loader本身是Item的派生类，但没有加载Component的Loader对象是不可见的，只是一个占位符，但一旦加载了Component，那么Loader的位置大小会影响Component。以下是处理按键的示例：
 
 ```c++
 Rectangle {
@@ -1594,7 +1594,82 @@ Rectangle {
 
 创建时设置组件的source，销毁时将其置为undefined。
 
+QML也支持在ECMAScript中动态的创建对象，有以下两种方式：
 
+- 使用Qt.createComponent动态的创建一个组件对象，然后使用Component的createObject方法创建对象；
+- 使用Qt.createQmlObject从一个QML字符串直接创建一个对象；
+
+如果在QML文件中创建了一个组件，而想动态的创建一个实例，则Qt.createComponent是比较好的方式，如果QML对象本身是在运行时产生，则Qt.createQmlObject可能是比较好的选择。
+
+createComponent方法可以利用QML文件动态创建一个组件，原型如下：
+
+```
+object createComponent(url, mode, parent)
+```
+
+url参数指向QML文档的本地路径或网络路径，mode指定模式，可以是Component.PreferSynchronous（优先同步模式）或Component.Asynchronous（异步模式）,忽略时采用优先同步模式，parent指定组件的父对象。示例如下：
+
+```
+Rectangle {
+    id: rootItem;
+    width: 360;
+    height: 300;
+    property  var count: 0;
+    property Component component: null;
+
+    Text {
+        id: coloredText;
+        text: "Hello World!";
+        anchors.centerIn: parent;
+        font.pixelSize: 24;
+    }
+
+    function changeTextColor(clr) {
+        coloredText.color = clr;
+    }
+
+    function createColorPicker(clr) {
+        if (rootItem.component == null) {
+            rootItem.component = Qt.createComponent("ColorPicker.qml");
+        }
+        var colorPicker;
+        if (rootItem.component.status == component.Ready)
+        {
+            colorPicker = rootItem.component.createObject(rootItem,
+                                  {"color":clr, "x":rootItem.count*55, "y":10});
+            colorPicker.colorPicked.connect(rootItem.changeTextColor);
+        }
+        rootItem.count++;
+    }
+
+    Button {
+        id: add;
+        text: "add";
+        anchors.left: parent.left;
+        anchors.leftMargin: 4;
+        anchors.bottom: parent.bottom;
+        anchors.bottomMargin: 4;
+        onClicked: {
+            createColorPicker(Qt.rgba(Math.random(), Math.random(), Math.random(), 1));
+        }
+    }
+}
+
+```
+
+其中createObject的第一个参数指定parent，第二个参数传递初始化参数。
+
+createQmlObject主要是根据QML字符串来创建对象，使用示例如下：
+
+```
+var newObject = Qt.createQmlObject('import QtQuick 2.2;
+				Rectangle {color: "red"; width: 20; height: 20}',
+				parentItem, "dynamicSnippet1");
+```
+
+第一个参数是QML字符串，第二个参数是指定父对象，第三个参数用于给创建的对象关联一个文件路径，主要用于报告错误。
+
+对于上述两种方式创建的对象，可以使用destroy方法进行销毁，其有一个可选的参数，用于指定延迟多少毫秒删除对象。
 
 ## Qt Quick元素布局
 
@@ -2042,6 +2117,110 @@ TextArea {
 
 TextArea不可定制cursor，但支持文本滚动，因为它继承自ScrollView。
 
+ExclusiveGroup（互斥分组）本身是不可见的元素，用于将若干个可选择的元素组合在一起供用户选择其中一个选项，可在ExclusiveGroup对象中定义RadioButton、CheckBox、Action等元素，而不需要设置exclusiveGroup属性；也可以定义一个只设置了id的ExclusiveGroup对象，在别处定义其他元素，并初始化exclusiveGroup属性。current属性指向互斥分组中第一个选中的元素。
+
+RadioButton用于多选一的场景，需要通过exclusiveGroup指定一个分组，可以跟GroupBox结合使用，使用时需要导入Controls模块。text属性存储单选按钮的文本，checked属性指示RadioButton是否被选中，hovered是只读属性，指示鼠标是否悬停在RadioButton上，pressed属性在按下时为true，当单选按钮被按下时，activeFocusOnPress属性为true，按钮获得焦点。
+
+RadioButtonStyle用来定制RadioButton，使用时需要引入QtQuick.Controls.Styles 1.x模块。background定制背景，indicator定制选中的图标，label定制单选按钮的文本，它们的类型都是Component。spacing指定图标和文本的间隔，control指向使用style的RadioButton对象，组件内的对象可以通过control访问RadioButton的各种属性。
+
+CheckBox是复选框，可以让我们选择一个或多个选项，相比RadioButton，CheckBox多了两个属性，partiallyCheckedEnabled属性指示是否允许部分选中状态，默认为false，checkedState记录选中状态，它的值可能是Qt.UnChecked、Qt.Checked或Qt.PartiallyChecked，所谓部分选中指一个选项下面有子选项，其中子选项被部分选中。需要注意的是，如果指定了exclusiveGroup属性，那么同属于一个互斥组的复选框也可以达到多选一的效果。定制Style时可以使用CheckBoxStyle。
+
+GroupBox（分组框）用于将其他的窗口部件组合在一起显示，最常用的是将单选按钮或者复选框放在分组框中显示。分组框一般有一个标题，默认带有边框，但可以设置flat属性为true来去掉左右底三条边的边框。GroupBox本身也支持选中，可通过checkable属性来设置，当设置为true时，标题会出现一个复选框，如果勾选了那么其子控件就是可选中的，否则就是不可操作的，当分组框可选时，checked属性保存其选中状态。分组框的尺寸根据其孩子的尺寸计算，如果想要使用锚布局来管理分组框的孩子，则需要显式指定分组框本身的尺寸。contentItem指向一个Item对象，代表分组框的内容区，在分组框内声明的孩子，其父亲被自动设置为contentItem，如果动态创建分组框中的孩子，则需要显式的将contentItem指定为它们的父亲。使用分组框需要导入QtQuick.Controls 1.x模块。
+
+ComboBox组合框由一个列表框和一个标签控件组成，列表框可以是一直显示的也可以是隐藏的，列表框中当前选中的项显示在标签控件或者编辑控件中。ComboBox的下拉列表是通过Menu实现的，列表中的每个条目对应一个MenuItem。editable属性决定下拉列表的编辑控件是否可以编辑，默认为false，editText保存编辑框的内容，同时也可以设置validator属性来限制用户可以输入的文本，编辑完成后ComboBox会发射accepted信号。ComboBox的find方法用来查找列表中是否存在指定的字符串，对于可编辑的ComboBox，向列表中添加条目可以使用此方法来滤重；textAt返回指定索引位置的字符串；selectAll可以选中可编辑的ComboBox的编辑框内的所有文本。下拉列表的数据从model属性来。model可以是一个简单的字符串列表，也可以是ListModel。count属性返回ComboBox下拉列表内的条目个数。风格可由ComboBoxStyle定制。
+
+ProgressBar是进度条，minimumValue代表最小值，maximumValue表示最大值，value是当前值，orientation代表方向，默认为Qt.Horizontal，水平方向，要想改成竖直方向可以设置为Qt.Vertical。style通过ProgressBarStyle来定制外观，indeterminate设置为true可以指示实际进度。
+
+TabView是选项卡控件，其中count是只读的，返回tabView内标签页的个数，currentIndex代表当前页的索引，从0开始，frameVisible指示标签页对应的内容周围的边框是否可见，tabVisible设置标签栏是否可见，tabPosition保存标签栏的位置，默认是Qt.TopEdge，而Qt.BottomEdge代表界面底部；addTab(title, component)方法用于增加一个标签，第一个参数是标签标题，第二个参数是标签对应的可视控件，insertTab(index, title, component)在指定索引位置插入一个标签；removeTab(index)删除指定位置的标签，moveTab(from, to)将一个标签从索引from移到索引to，getTab(index)返回指定位置的标签对象（类型为Tab），Tab对象只有一个title属性，是Loader的派生类。其风格也可由TabViewStyle控制。
+
+Slider代表滑块控件，滑块分为面板、滑槽、刻度线和滑块四部分，可使用SliderStyle的panel、groove、tickmarks和handle来进行定制，但一般只定制handle和groove，另外两个定制起来略微麻烦；maximumValue用来设置最大值，默认值为10，minimumValue用来设置最小值，默认为0，value代表滑块控件的当前值，默认为0，使用onValueChanged信号处理器可以跟踪滑块当前值的变化；stepSize设置滑块变化的步长，orientation设置滑块的方向，updateValueWhileDragging设置拖动滑块时控件的当前值是否变化，默认为true；hovered指示鼠标是否悬停在控件上方，pressed指示鼠标或手指是否按下；activeFocusOnPress属性指示当用户按下鼠标时控件是否获得键盘焦点，默认为false。
+
+Flickable比较特别，其中的Item可以被拖动，当子Item的边界显示之后在拖动，会有抖动的效果。有如下的示例：
+
+```
+Flickable {
+	width: 200;
+	height: 200;
+	contentWidth: image.width;
+	contentHeight: image.height;
+	Image {
+		id: image;
+		source: "bigImage.png";
+	}
+}
+```
+
+contentWidth与contentHeight存储Flickable控制的Item的实际大小，如果不设置则会根据contentItem的childrenRect.width和childrenRect.height来设置，当Flickable开始被拖动，发出movementStared信号，当用户释放鼠标或手指时，如果控制的Item的边界还没显示，就发射movementEnded信号，如果拖着拖着Item的边界显露出来了，并且被拖离了Flickable的边界，此时释放手指flickStarted信号发射，然后，受控Item会抖一阵子，最后静止，此时发射flickEnded信号，紧接着发射movementEnded信号；contentX、contentY保存受控Item左上角的坐标；
+
+要使用Screen要引入QtQuick.Window模块，Screen对象指的是显示Item的那个屏幕，desktopAvailableWidth、desktopAvailableHeight保存应用可以使用的屏幕区域的大小，width、height保存屏幕的宽高，orientation保存屏幕的方向，primaryOrientation表示屏幕的基本方向，取值可能是Qt.LandscapeOrientation、Ot.PortraitOrientation、Qt.PrimaryOrientation等，当屏幕高大于宽时方向是Qt.PortraitOrientation，否则就是Qt.LandscapeOrientation；pixelDensity表示每毫米的像素数，类似于PPI。
+
+## Canvas(画布)
+
+Canvas是画布，可以定义一个绘画区域，使用ECMAScript来绘制直线、矩形等图元。
+
+Canvas是Item的派生类，通过设置width和height属性，可以确定一个绘画区域，然后在onPaint信号处理器内部使用Context2D来绘图。如下示例：
+
+```
+Canvas {
+    width: 400;
+    height: 240;
+    onPaint: {
+        var ctx = getContext("2d");
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "red";
+        ctx.fillStyle = "blue";
+        ctx.beginPath();
+        ctx.rect(100, 80, 120, 80);
+        ctx.fill();
+        ctx.stroke();
+    }
+
+}
+```
+
+这是在onPaint信号处理器中调用了getContext("2d")获取Context2D对象，另外还有一种方式，即设置contextType属性为2d，那么context属性就会保存一个可用的Context2D对象。上述代码可改为：
+
+```
+Canvas {
+    width: 400;
+    height: 240;
+    contextType: "2d";
+    onPaint: {
+        context.lineWidth = 2;
+        context.strokeStyle = "red";
+        context.fillStyle = "blue";
+        context.beginPath();
+        context.rect(100, 80, 120, 80);
+        context.fill();
+        context.stroke();
+    }
+
+}
+```
+
+使用Context2D绘制路径一般有如下的步骤：
+
+- 调用begin()；
+- 调用moveTo()、lineTo()、arcTo()等方法；
+- 调用fill或者stroke；
+
+createLinearGradient方法用于创建一个线性渐变的对象，createRadialGradient方法创建一个放射渐变对象，CanvasGradient对象的addColorStop方法可以添加渐变路径上关键点的颜色；moveTo方法可以移动某个点，以此点作为起点开始一个新路径，closePath方法用于结束当前路径，从终点到起点绘制一条直线封闭路径。
+
+Context2D对象与文本相关的方法有fillText、strokeText以及text，其中fillText方法使用fillStyle填充文字，strokeText使用strokeStyle描画文字边框，text在路径上添加一串文本作为构成路径的元素之一。
+
+Context2D有三种形式的drawImage方法，drawImage(variant image, real dx, real dy)是最简单的一个，其在(dx, dy)位置绘制image对象代表的图像，image可以是一个Image元素、一个图片URL或者一个CanvasImageData对象。第二种方法是drawImage(variant image, real dx, real dy, real dw, real dh)；第三种形式drawImage(variant image, real sx, real sy, real sw, real sh, real dx, real dy, real dw, real dh)。
+
+Context2D也支持平移旋转缩放等操作，通过translate移动坐标系的原点，平移绘图操作完成后，应当调用restore来恢复画布状态，而要restore必须先save。
+
+clip裁切方法有以下的步骤：
+
+- 调用beginPath；
+- 使用lineTo、arc、bezierCurveTo、moveTo以及closePath等创建路径；
+- 调用clip确定裁剪区域；
+- 绘图；
+
+
+
 ## C++与QML混合编程
 
 C++与QML对象之间可以相互访问。
@@ -2401,7 +2580,7 @@ Model-View-Controller（MVC）源自设计模式，将系统分解为模型、�
 
 QAbstractItemModel是大多数模型类型的祖先，比如QAbstractListModel、QAbstractProxyModel、QAbstractTableModel、QFileSystemModel、QStringListModel、QStandardItemModel等；QAbstractItemView是大多数视图类的祖先，如QListView、QTableView、QTreeView等；QAbstractItemDelegate则是Qt Model-View框架中所有Delegates的抽象基类，其又延申出QStyleItemDelegate和QItemDelegate两个分支，如果要实现自己的Delegate，可以从这两个类中选择一个作为基类，Qt推荐使用QStyleItemDelegate。
 
-ListView用来显示一个条目列表，条目对于的数据来自Model，而外观则由Delegate决定，Model可以是QML内建类型，如ListModel、XmlListModel，也可以是C++中实现的QAbstractItemModel或QAbtractListModel的派生类，示例如下：
+ListView用来显示一个条目列表，条目对应的数据来自Model，而外观则由Delegate决定，Model可以是QML内建类型，如ListModel、XmlListModel，也可以是C++中实现的QAbstractItemModel或QAbtractListModel的派生类，示例如下：
 
 ```c++
 Rectangle {

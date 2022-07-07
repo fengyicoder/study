@@ -31,6 +31,7 @@ int main(int argc, char *argv[])
     qDebug("y: %d", y);
     QRect geometry = widget.geometry();
     QRect frame = widget.frameGeometry();
+    
     qDebug() << "geometry: " << geometry << "frame: " << frame;
     return a.exec();
 }
@@ -255,3 +256,23 @@ void MyWidget::on_pushButton_8_clicked()
 ### 其他窗口部件
 
 QFrame类是带有边框的部件的基类，它的子类包括最常用的标签部件QLabel、QLCDNumber、QSplitter、QStackedWidget、QToolBox和QAbstractScrollArea类。QAbstractScrollArea类是所有带有滚动区域部件类的抽象基类。QFrame类的主要功能是用来实现不同的边框效果，由边框形状和边框阴影组合形成。
+
+## 事件系统
+
+在Qt中，事件作为一个对象，继承自QEvent类，常见的有键盘事件QKeyEvent、鼠标事件QMouseEvent和定时器事件QTimeEvent等。
+
+### Qt中的事件
+
+事件是应用程序需要知道的内部或外部发生的事情或者动作的统称。Qt中使用一个对象来表示一个事件，继承自QEvent类，任何QObject子类实例都可以接收和处理事件。
+
+一个事件由一个特定的QEvent子类表示，但有时一个事件又包含多个类型，比如鼠标事件又包含鼠标按下、双击、移动等操作，这些事件类型可由QEvent::type来表示。有了事件还要知道如何处理事件，QCoreApplication类的notify函数的帮助文档给了五种处理事件的方法：
+
+- 重新实现部件的paintEvent()、mousePressEvent()等事件处理函数，这是最常用的方法，但只能应用于特定部件的特定方法；
+- 重新实现notify函数，可实现完全的控制，能在事件过滤器得到事件之前就获得事件，但一次只能处理一个事件；
+- 向QApplication对象上安装事件过滤器，因为一个程序只有一个Application对象，所以这这样实现与实现notify的功能一致，优点是可以处理多个事件；
+- 重新实现event函数，可以在事件到达默认的事件处理函数之前进行处理；
+- 在对象上安装事件过滤器，使用事件过滤器可以在一个界面类中同时处理不同子部件的不同事件；
+
+在实际的使用中，最常用的是方法一，其次是方法五，方法二需要继承QApplication类，方法三则要用一个全局的事件过滤器。
+
+每个程序在调用QApplication类的exec函数后，会使得Qt应用程序进入事件循环，这样就可以接收各种各样的事件，一旦有事件发生，Qt就会构建一个QEvent子类的对象来表示它，然后将其传递给相应的QObject对象或其子对象。
