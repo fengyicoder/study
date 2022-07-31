@@ -525,7 +525,7 @@ private:
 };
 ```
 
-其中重写了data与setSourceModel方法，前者向ThumbnailProxyModel的客户端发送数据，后者注册到原模型发送的信号中。其实现如下：
+其中重写了data与setSourceModel方法，前者向ThumbnailProxyModel的客户端发送数据，后者注册注册信号到原模型中。其实现如下：
 
 ```c++
 #include "ThumbnailProxyModel.h"
@@ -649,7 +649,7 @@ ApplicationWindow {
 }
 ```
 
-为了防止QML组件破坏stackView，这里使用property alias定义了一个属性别名，并设置为只读属性方便更改。
+这里使用property alias定义了一个属性别名，方便从其他组件访问，另外，为了防止QML组件破坏stackView，设置为只读属性。
 
 在qml文件中也可以声明单例类型，需要两步，有如下的qml文件：
 
@@ -691,3 +691,477 @@ ToolBar {
 ```
 
 qml单例需要显式导入才能加载qmldir文件，所以这里使用了import "."。
+
+
+
+## 第九章 Keeping Your Sanity with Multithreading
+
+本章了解Qt中线程如何工作。Qthread是Qt线程系统的中心类，一个QThread实例管理一个线程。我们可以重写QThread派生类中的run方法，其会在QThread框架中执行，以下是启动一个线程的示例：
+
+```c++
+QThread thread;
+thread.start()
+```
+
+start方法调用时会自动调用run函数，并发射started信号，只有在这个时候，新的执行线程才被创建，当run函数执行完毕时，会发射finished信号，这与信号/槽机制相似。Qt是一个事件驱动的框架，主事件循环（或GUI循环），处理事件则刷新UI。
+
+每个QThread都有自己的事件循环，可以处理主循环以外的事件，如果没有重写，run函数会调用QThread::exec()函数，来启动事件对象的事件循环。我们也可以重写QThread类并调用自己的exec()函数，例如：
+
+```c++
+class Thread: public QThread
+{
+Q_OBJECT
+protected:
+	void run()
+	{
+		Object* myObject = new Object();
+		connect(myObject, &Object::started, this, &Thread::doWork);
+		exec();
+	}
+private slots: 
+	void doWork();
+};
+```
+
+仅在exec()执行时，Thread事件循环才会处理started信号，它将阻塞并等待，直到exit被调用。
+
+需要注意的是事件循环中的事件值得是从线程创建或移动到该线程的所有对象。
+
+在QCoreApplication对象之前创建的线程没有线程亲和性，因此，不会向其发送任何事件。
+
+通过下面的例子来看一下线程如何通信：
+
+```c++
+class Thread: public QThread
+{
+	Q_OBJECT
+	void run {
+		emit result("I < 3 threads");
+	}
+signals:
+	void result(QString data);
+};
+Thread* thread = new Thread(this);
+connect(thread, &Thread::result, this, &MainWindow::handleResult);
+connect(thread, &Thread::finished, thread, &QObject::deleteLater);
+thread->start();
+```
+
+上面的信号为何能够跨线程通信，这就要看connect的完整签名：
+
+```
+QObject::connect(
+const QObject *sender, const char *signal,
+const QObject *receiver, const char *method,
+Qt::ConnectionType type = Qt::AutoConnection)
+```
+
+关键字Qt::AutoConnection是默认值，来看看Qt::ConnectionType的完整取值：
+
+- Qt::AutoConnection：如果接收者位于发出信号的进程中，则使用此值，否则使用Qt::QueuedConnection；
+- Qt::DirectConnection：槽在信号发出时立即被调用，该槽在发信线程中执行；
+- Qt::QueuedConnection：当控制信号返回接收线程的事件循环时调用该槽，该槽在接收线程中执行；
+- Qt::BlockingQueuedConnection：与Qt::QueuedConnction相同，只是发信线程阻塞直到槽执行完毕返回，如果接收者位于信号线程则不得使用此值，否则程序将死锁；
+- Qt::UniqueConnection：此标志可使用或操作与前述任意一种连接类型连接，当设置此标志，如果连接已经存在，则连接将失效；
+
+当使用Qt::AutoConnection时，只有当有效发出信号时，ConnectionType才会解析。
+
+Qt也支持worker模型，可将线程从实际的进程中分离出来，如下：
+
+```c++
+class Worker: public QObject
+{
+	Q_OBJECT
+public slots:
+	void doWork()
+	{
+		emit result("workers are the best");
+	}
+signals:
+	void result(QString data);
+}
+// Somewhere in MainWindow
+QThread* thread = new Thread(this);
+Worker* worker = new Worker();
+worker->moveToThread(thread);
+connect(thread, &QThread::finished,
+worker, &QObject::deleteLater);
+connect(this, &MainWindow::startWork,
+worker, &Worker::doWork);
+connect(worker, &Worker::resultReady,
+this, handleResult);
+thread->start();
+// later on, to stop the thread
+thread->quit();
+thread->wait();
+```
+
+实际工作对象与线程分离开来，通过使用moveToThread，worker对象被转移到thread线程中，另外，一旦调用了start，我们就不能转移对象。
+
+Qt中的互斥锁通过QMutex提供，如下：
+
+```c++
+QMutex mutex；
+int number = 1;
+mutex.lock();
+number *= 2;
+mutex.unlock();
+```
+
+这种情况下可能会忘记解锁，所以Qt提供了QMutexLocker类来简化这种情况：
+
+```c++
+QMutex mutex;
+QMutexLocker locker(&mutex);
+......
+```
+
+更高级的用法，可以使用QThreadPool类来管理线程池。要在线程池管理的线程中执行代码，可以定义相关的处理类，但要继承QRunnable，如下：
+
+```c++
+class Job: public QRunnable
+{
+	void run()
+	{ ... }
+}
+Job* job = new Job();
+QThreadPool::globalInstance()->start(job);
+```
+
+QThreadPool::start()拥有job的所有权，并将在run完成时自动删除。
+
+如果想要手动管理线程可以使用QThreadPool::idealThreadCount()来获得可以使用的线程数量。Qt也提供了一种更高级的api，可以避免使用互斥锁等手段。这种方法依赖QFuture类执行函数，并期望稍后得到结果：
+
+```c++
+void longRunningFunction();
+QFuture<void> future = QtConcurrent::run(longRunningFunction);
+```
+
+处理函数会在线程池中分离出的线程中执行。有参的使用如下：
+
+```c++
+QImage processGrayscale(QImage& image);
+QImage lenna;
+QFuture<QImage> future = QtConcurrent::run(processGrayscale, lenna);
+QImage grayscaleLenna = future.result();
+```
+
+为了避免阻塞，我们可以使用QFutureWatcher来辅助，如下：
+
+```
+QFutureWatcher<QImage> watcher;
+connect(&watcher, &QFutureWatcher::finished, this, &QObject::handleGrayscale);
+QImage processGrayscale(QImage& image);
+QImage lenna;
+QFuture<QImage> future = QtConcurrent::run(processGrayscale, lenna);
+watcher.setFuture(future);
+```
+
+当拿到期望值后，会调用processGrayscale槽进行处理；
+
+Qt也提供了MapReduce和FilterReduce的实现，MapReduce是一种编程模型：
+
+- 在CPU的多核之间映射和分发对数据集的处理；
+- 缩减或聚合结果提供给调用者；
+
+如下：
+
+```c++
+QList image = ...;
+QImage processGrayscale(QImage& image);
+QFuture<void> future = QtConcurrent::mapped(images, processGrayscale);
+```
+
+该操作可以通过QtConncurrent::mapped而不是QtConcurrent::blockingMapped来阻塞；
+
+MapReduce的实际使用如下：
+
+```c++
+QList images = ...;
+QImage processGrayscale(QImage& image);
+void combineImage(QImage& finalImage, const QImage& inputImage);
+QFuture<void> future = QtConcurrent::mappedReduced(
+						images,
+						processGrayscale,
+						combineImage);
+```
+
+processGrayscale的中间结果会被合并到finalImage中，每个线程只调用一次combineImage，因此无需对结果加锁。
+
+FilterReduce与之类似，允许我们对输入列表进行过滤而不是转换。
+
+可使用setMaxThreadCount(x)来设置QThreadPool的线程数。
+
+有如下的代码示例：
+
+```c++
+MandelbrotWidget::MandelbrotWidget(QWidget *parent) : QWidget(parent),
+    mMandelbrotCalculator(), mThreadCalculator(this), mScaleFactor(DEFAULT_SCALE),
+    mLastMouseMovePosition(), mMoveOffset(DEFAULT_OFFSET_X, DEFAULT_OFFSET_Y), mAreaSize(), mIterationMax(ITERATION_MAX)
+{
+    mMandelbrotCalculator.moveToThread(&mThreadCalculator);
+    connect(this, &MandelbrotWidget::requestPicture,
+            &mMandelbrotCalculator,
+            &MandelbrotCalculator::generatePicture);
+    mThreadCalculator.start();
+}
+```
+
+为了防止干扰UI线程，第一件事就是更改线程的亲和性，使得计算处理委托给计算线程。
+
+析构时退出线程：
+
+```c++
+MandelbrotWidget::~MandelbrotWidget()
+{
+    mThreadCalculator.quit();
+    mThreadCalculator.wait(1000);
+    if (!mThreadCalculator.isFinished()) {
+        mThreadCalculator.terminate();
+    }
+}
+```
+
+
+
+## 第十章 Need IPC？Get Your Minions to Work
+
+本章主要介绍了在不同进程之间的线程共享数据。IPC（进程间通信）的第一个工具就是TCP/IP套接字。示例如下：
+
+```c++
+QTcpServer* tcpServer = new QTcpServer(this);
+tcpServer->listen(QHostAddress::Any, 5000);
+
+connect(tcpServer, &QTcpServer::newConnection, [tcpServer]{
+	QTcpSocket *tcpSocket = tcpServer->nextPendingConnection();
+	QByteArray response = QString("Hello").toLatin1();
+	tcpSocket->write(response);
+	tcpSocket->disconnectFromHost();
+	qDebug() << "Send response and close the socket";
+});
+```
+
+第一步是实例化一个QTcpServer类，然后调用listen函数，可以提供网络接口并指定服务器必须侦听的端口，例如本例中在端口5000上监听所有的网络地址。当客户端与服务器建立连接时，QTcpServer::newConnection()信号会触发，会首先搜索与客户端连接服务端，之后通过socket发送消息，发送消息之后与客户端断开连接。
+
+测试可以通过各平台的telnet命令来测试，客户端的使用如下：
+
+```c++
+QTcpSocket *tcpSocket = new QTcpSocket(this);
+tcpSocket->connectToHost("127.0.0.1", 5000);
+connect(tcpSocket, &QTcpSocket::connected, [tcpSocket]{
+	qDebug() << "connected";
+});
+connect(tcpSocket, &QTcpSocket::readyRead, [tcpSocket]{
+	qDebug() << QString::fromLatin1(tcpSocket->readAll());
+});
+connect(tcpSocket, &QTcpSocket::disconnected, [tcpSocket]{
+	qDebug() << "disconnected";
+});
+```
+
+这种通信是双向的，所以客户端也可以写数据，服务器可以读，但注意要删除服务器部分中的disconnectFromHost()调用来保持通信活跃。
+
+第二种IPC技术是共享内存，通过QSharedMemory来提供一种跨平台的方法创建和使用跨多个进程的共享内存。这些进程必须在同一台计算机上运行，共享内存由密钥标识，所有进程必须使用相同的密钥来共享相同的共享内存段。第一个进程创建共享内存，如下：
+
+```
+QString sharedMessage("Hello");
+QByteArray sharedData = shareMessage.toLatin1();
+QSharedMemory* sharedMemory = new QSharedMemory("sharedMemoryKey", this);
+sharedMemory->create(sharedMessage.size());
+sharedMemroy->lock();
+memcpy(sharedMemory->data(), sharedData.data(), sharedData.size());
+sharedMemory->unlock();
+```
+
+销毁QShareMemory类将调用detach()函数将进程与共享内存分离。
+
+以下是其他线程如何使用共享内存：
+
+```c++
+QSharedMemory* sharedMemory = new QSharedMemory("sharedMemoryKey", this);
+sharedMemory->attach();
+sharedMemroy->lock();
+QByteArray sharedData(sharedMemory->size(), '\0');
+memcpy(sharedData.data(), sharedMemory->data(), sharedMemory->size());
+sharedMemory->unlock();
+QString sharedMessage = QString::fromLatin1(sharedData);
+qDebug() << sharedMessage;
+sharedMemory->detach();
+```
+
+注意，create和attach默认指定QShareMemory::ReadWrite访问，还可以使用QShareMemory::ReadOnly访问。
+
+另一种IPC方式是使用QProcess类，主进程将额外的应用以子进程的形式启动，使用标准的输入输出设备进行通信。示例如下：
+
+```c++
+QProcess* childProcess = new QProcess(this);
+connect(childProcess, &QProcess::readyReadStandardOutput, [childProcess] {
+	qDebug().noquote() << "[*]" << childProcess->readAll();
+});
+connect(childProcess, &QProcess::started, [childProcess] {
+	childProcess->write("Sophie\n");
+});
+childProcess->start("/path/to/hello");
+```
+
+最后以一种IPC机制是D-Bus协议。这种协议最有用的一点是甚至可以在总线上使用信号/槽机制，即从一个程序发出信号，另一个程序的槽进行处理。KDE和GNOME等linux桌面环境使用D-Bus，这意味着可以使用D-Bus控制桌面。D-Bus的概念如下：
+
+- bus：用于多对多通信，定义了两种总线：system和session；
+- service name：总线上服务的标识符；
+- message：应用程序发送的消息，如果使用总线，则消息包括目的地；
+
+在qt安装目录下有Qt D-Bus viewer工具，可以显示总线上所有的对象和消息。以下是使用方法：
+
+```c++
+//HelloService.h
+class HelloService : public QObject
+{
+	Q_OBJECT
+public slots:
+    QString sayHello(const QString &name);
+};
+//HelloService.cpp
+QString HelloService::sayHello(const QString& name)
+{
+    qDebug().noquote() << name << " is here!";
+    return QString("Hello %1!").arg(name);;
+}
+```
+
+首先进行了声明，之后注册DBus服务：
+
+```c++
+HelloService helloService;
+QString serviceName("org.masteringqt.QtDBus.HelloService");
+QDBusConnection::sessionBus().registerService(serviceName);
+QDBusConnection::sessionBus().registerObject("/",
+&helloService, QDBusConnection::ExportAllSlots);
+```
+
+这段代码注册了一个新服务，并公开了它的所有的槽。
+
+```c++
+QString serviceName("org.masteringqt.QtDBus.HelloService");
+QDBusInterface serviceInterface(serviceName, "/");
+QDBusReply<QString> response = serviceInterface.call(
+"sayHello", "Lenna");
+qDebug().noquote() << response;
+```
+
+通过serviceInterface对象来调用远端方法sayHello。
+
+在编写代码的时候，有以下的示例：
+
+```c++
+struct Message {
+
+    enum class Type {
+        WORKER_REGISTER,
+        WORKER_UNREGISTER,
+        ALL_JOBS_ABORT,
+        JOB_REQUEST,
+        JOB_RESULT,
+    };
+
+    Message(const Type type = Type::WORKER_REGISTER,
+            const QByteArray& data = QByteArray()) :
+        type(type),
+        data(data)
+    {
+    }
+
+    ~Message() {}
+
+    Type type;
+    QByteArray data;
+};
+```
+
+这里使用了C++11的枚举类，可以防止命名污染，隐式转换，以及可以前向声明。
+
+```c++
+struct JobRequest
+{
+    int pixelPositionY;
+    QPointF moveOffset;
+    double scaleFactor;
+    QSize areaSize;
+    int iterationMax;
+};
+
+inline QDataStream& operator<<(QDataStream& out, const JobRequest& jobRequest)
+{
+    out << jobRequest.pixelPositionY
+        << jobRequest.moveOffset
+        << jobRequest.scaleFactor
+        << jobRequest.areaSize
+        << jobRequest.iterationMax;
+    return out;
+}
+
+inline QDataStream& operator>>(QDataStream& in, JobRequest& jobRequest)
+{
+    in >> jobRequest.pixelPositionY;
+    in >> jobRequest.moveOffset;
+    in >> jobRequest.scaleFactor;
+    in >> jobRequest.areaSize;
+    in >> jobRequest.iterationMax;
+    return in;
+}
+
+Q_DECLARE_METATYPE(JobRequest)
+```
+
+这里使用了Q_DECLARE_METATYPE宏，该宏使得Qt元对象系统知道JobRequest，这需要能够与QVariant结合使用该类，具体的使用会在后面看到。
+
+QDataStream类实现了C++基本类型和几种Qt类型（QBrush、QColor、QString等）的序列化，示例如下：
+
+```c++
+QFile file("myfile");
+file.open(QIODevice::WriteOnly);
+QDataStream out(&file);
+out << QString("QDataStream saved my day");
+out << (qint32)42;
+```
+
+实际使用可以如下这么使用：
+
+```c++
+inline void sendMessage(QTcpSocket& socket,
+                        Message::Type messageType,
+                        QByteArray& data,
+                        bool forceFlush = false)
+{
+    Message message(messageType, data);
+
+    QByteArray byteArray;
+    QDataStream stream(&byteArray, QIODevice::WriteOnly);
+    stream << message;
+    socket.write(byteArray);
+    if (forceFlush) {
+        socket.flush();
+    }
+}
+```
+
+阅读消息可以如下写：
+
+```c++
+inline std::unique_ptr<std::vector<std::unique_ptr<Message>>> readMessages(QDataStream& stream)
+{
+    auto messages = std::make_unique<std::vector<std::unique_ptr<Message>>>();
+    bool commitTransaction = true;
+    while (commitTransaction
+                    && stream.device()->bytesAvailable() > 0) {
+        stream.startTransaction();
+        auto message = std::make_unique<Message>();
+        stream >> *message;
+        commitTransaction = stream.commitTransaction();
+        if (commitTransaction) {
+            messages->push_back(std::move(message));
+        }
+    }
+    return messages;
+}
+```
+
