@@ -33,3 +33,8 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen;)
 int connect(int sockfd, struct sockaddr *serv_addr, socklen_t addrlen);
 ```
 
+客户端使用也需要两步：
+
+- 创建套接字
+- 调用connect向服务器发送连接请求
+
