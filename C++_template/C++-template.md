@@ -558,3 +558,522 @@ Stack intStack = 0; // Stack<int> deduced since C++17
 
 - 由于定义了int作为参数的构造函数，要记得要编译器要求生成默认构造函数及其全部默认行为，这是因为默认构造函数只有在没有定义其他构造函数的情况下才会默认生成；
 - 初始化elems时采用了初始化列表，相当于用{elem}来初始化elems，这是因为vector没有接受一个参数的构造函数；
+
+当通过字符串常量来初始化Stack时，会带来一堆的问题，如：
+
+```c++
+Stack stringStack = "bottom";
+```
+
+由于参数是按照T的引用进行传递，那么参数类型不会退化，相当于初始化了一个这样的Stack：
+
+```c++
+Stack<char const[7]>
+```
+
+这样我们就不能继续向Stack追加一个不同维度的字符串常量了。如果参数是按值传递的，参数类型就会被退化，裸数组将退化为裸指针，这样参数类型会是char const*，基于以上原因，有必要将构造函数声明改为值传递方式，如下：
+
+```c++
+template<typename T>
+class Stack {
+private:
+	std::vector<T> elems; // elements
+public:
+    Stack () = default;
+    Stack (T elem) // initialize stack with one element by value
+    : elems({elem}) {
+    }
+    …
+};
+```
+
+针对以上的问题，除了将构造函数改为按值传递，还有一个方案：由于在容器中处理裸指针容易导致很多问题，对于容器一类的类，不应该将类型推断为字符的裸指针，可以通过提供”推断指引“来提供额外的模板参数推断规则，或者修正已有的模板参数推断规则。比如我们可以定义，当传递一个字符串常量或者C类型的字符串时，应该用std::string实例化Stack模板类：
+
+```c++
+Stack(char const*) -> Stack<std::string>;
+```
+
+这个指引语句必须出现在和模板类的定义相同的作用域或命名空间内，它通常紧跟着模板类的定义，->后面的类型被称为推断指引的"guided type"。现在有以下的结果：
+
+```c++
+Stack stringStack{"bottom"}; //OK
+Stack stringStack = "bottom"; //fail
+```
+
+模板参数推断的结果也是可以拷贝的，在将stringStack声明为Stack\<std::string\>之后，下面初始化的结果也是正确的：
+
+```c++
+Stack stack2{stringStack};
+```
+
+聚合类（这样一类class或者struct：没有用户定义的显式的或继承来的构造函数，没有private或者protected的非静态成员，没有虚函数，没有virtual，private或者protected的基类）也可以是模板。比如：
+
+```c++
+template<typename T>
+struct ValueWithComment {
+	T value;
+	std::string comment;
+};
+```
+
+从C++17开始，对于聚合类的模板甚至可以使用类型推断指引，如下：
+
+```c++
+ValueWithComment(char const*, char const*) -> ValueWithComment<std::string>;
+ValueWithComment vc2 = {"hello", "initial value"};
+```
+
+标准库的std::array<>类也是一个聚合类。
+
+## 非类型模板参数
+
+对于非类型模板参数，待定的不再是类型，而是某个数值，在使用这种模板时需要显式的指出待定数值的具体值，之后代码会被实例化。
+
+有如下的代码：
+
+```c++
+#include <array>
+#include <cassert>
+template<typename T, std::size_t Maxsize>
+class Stack {
+	private:
+		std::array<T, Maxsize> elems;
+		std::size_t numElems;
+	public:
+		Stack();
+		void push(T const& elem);
+		T const& top() const;
+		bool empty() const {
+			return numElems == 0;
+		}
+		std::size_t size() const {
+			return numElems;
+		}
+};
+template<typename T, std::size_t Maxsize>
+Stack<T, Maxsize>::Stack(): numElems(0)
+{}
+template<typename T, std::size_t MaxSize>
+void Stack<T, Maxsize>::push(T const& elem)
+{
+    assert(numElems < Maxsize);
+    elems[numElems] = elem;
+    ++numElems;
+}
+template<typename T, std::size_t Maxsize>
+void Stack<T, Maxsize>::pop()
+{
+    assert(!elems.empty());
+    --numElems;
+}
+template<typename T, std::size_t Maxsize>
+T const& Stack<T, Maxsize>::top() const
+{
+    assert(!elems.empty());
+    return elems[numElems-1];
+}
+```
+
+对非类型模板参数，也可以指定默认值：
+
+```c++
+template<typename T=int, std::size_t Maxsize=100>
+class Stack {
+	...
+};
+```
+
+同样，也可以为函数模板定义非类型模板参数，如：
+
+```c++
+template<int Val, typename T>
+T addValue(T x)
+{
+	return x + Val;
+}
+```
+
+同样的，也可以基于前面的模板参数推断出当前模板参数的类型，比如可以通过传入的非类型模板参数推断出返回类型：
+
+```c++
+template<auto Val, typename T = decltype(Val)>
+T foo();
+```
+
+或者可以通过以下的方式确保传入的非类型模板参数的类型和类型参数的类型一致
+
+```c++
+template<typename T, T val = T{}>
+T bar();
+```
+
+使用非类型模板参数是有限制的，通常它们只能是整型常量（包含枚举），指向object/functions/members的指针，objects或者functions的左值引用，或者是std::nullptr_t。浮点型数值和class类型的对象都不能作为非类型模板参数使用：
+
+```c++
+template<double VAT> // ERROR: floating-point values are not
+double process (double v) // allowed as template parameters
+{
+return v * VAT;
+}t
+emplate<std::string name> // ERROR: class-type objects are not
+class MyClass { // allowed as template parameters
+…
+};
+```
+
+当传递对象的指针或者引用作为模板参数时，对象不能是字符串常量，临时变量或者数据成员以及其他子对象，另外还有一些针对版本的限制：
+
+- C++11，对象必须要有外部链接；
+- C++14，对象必须是外部链接或者内部链接；
+
+```c++
+extern char const s03[] = "hi"; // external linkage
+char const s11[] = "hi"; // internal linkage
+int main()
+{
+    MyClass<s03> m03; // OK (all versions)
+    MyClass<s11> m11; // OK since C++11
+    static char const s17[] = "hi"; // no linkage
+    MyClass<s17> m17; // OK since C++17
+}
+```
+
+非类型模板参数可以是任何编译器表达式，如下：
+
+```c++
+template<int I, bool B>
+class C;
+...
+C<sizeof(int)+4, sizeof(int)==4> c; 
+```
+
+如果在表达式中使用了operator>，就必须放在括号里面，防止>作为模板参数列表的末尾，从而截断列表，应采用如下写法：
+
+```c++
+C<42, (sizeof(int)>4)> c;
+```
+
+从C++17开始，可以不指定非类型模板参数的具体类型，可用auto来代替，比如有以下的示例：
+
+```c++
+#include <array>
+#include <cassert>
+template<typename T, auto Maxsize>
+class Stack {
+public:
+	using size_type = decltype(Maxsize);
+private:
+    std::array<T,Maxsize> elems; // elements
+    size_type numElems; // current number of elements
+public:
+    Stack(); // constructor
+    void push(T const& elem); // push element
+    void pop(); // pop element
+    T const& top() const; // return top element
+    bool empty() const { //return whether the stack isempty
+    return numElems == 0;
+    }
+    size_type size() const { //return current number of elements
+        return numElems;
+    }
+};
+// constructor
+template<typename T, auto Maxsize>
+Stack<T,Maxsize>::Stack ()
+: numElems(0) //start with no elements
+{
+	// nothing else to do
+}
+template<typename T, auto Maxsize>
+void Stack<T,Maxsize>::push (T const& elem)
+{
+    assert(numElems < Maxsize);
+    elems[numElems] = elem; // append element
+    ++numElems; // increment number of elements
+}
+template<typename T, auto Maxsize>
+void Stack<T,Maxsize>::pop ()
+{
+    assert(!elems.empty());
+}
+
+```
+
+C++14开始，也可以使用auto，让编译器推断出具体返回类型。
+
+从C++17开始，可以通过标准类型萃取std::is_same和decltype来验证两个类型是否一致：
+
+```c++
+if (!std::is_same<decltype(size1), decltype(size2)>::value) {
+	std::cout << "size types differ" << "\n";
+}
+```
+
+从17开始，对返回类型的类型萃取，可以通过使用下标_v省略掉::value，因此可以这样简写：
+
+```c++
+if (!std::is_same_v<decltype(size1), decltype(size2)>) {
+	std::cout << "size types differ" << "\n";
+}
+```
+
+也可以使用template\<decltype(auto)\>，将N实例化引用类型：
+
+```c++
+template<decltype(auto) N>
+class C {
+…
+};
+int i;
+C<(i)> x; // N is int&
+```
+
+## 变参模板
+
+即可以将参数定义成能接受多个模板参数的情况，比如：
+
+```c++
+#include <iostream>
+void print() {}
+template<typename T, typename... Types>
+void print(T firstArg, Types... args) {
+	std::cout << firstArg << "\n";
+	print(args...);
+}
+```
+
+也可以这样写：
+
+```c++
+#include <iostream>
+template<typename T>
+void print (T arg)
+{
+	std::cout << arg << ’\n’; //print passed argument
+}
+template<typename T, typename… Types>
+void print (T firstArg, Types… args)
+{
+    print(firstArg); // call print() for the first argument
+    print(args…); // call print() for remainingarguments
+}
+```
+
+当两个模板的区别只在于尾部的参数包的时候，会优先选择没有尾部参数包的那个模板。
+
+C++11为变参模板引入了新的sizeof运算符：sizeof...。它被扩展为参数包包含的参数数目。使用如下：
+
+```c++
+template<typename T, typename… Types>
+void print (T firstArg, Types… args)
+{
+    std::cout << firstArg << ’\n’; //print first argument
+    std::cout << sizeof…(Types) << ’\n’; //print number of remaining
+    types
+    std::cout << sizeof…(args) << ’\n’; //print number of remaining
+    args
+    …
+}
+```
+
+如果我们不定义不接受参数的print函数，那么以下的代码就是错误的：
+
+```c++
+template<typename T, typename… Types>
+void print (T firstArg, Types… args)
+{
+    std::cout << firstArg << ’\n’;
+    if (sizeof…(args) > 0) { //error if sizeof…(args)==0
+    	print(args…); // and no print() for no arguments declared
+    }
+}
+```
+
+这是因为是否使用实例化的代码是在运行期间决定的，而是否实例化代码确是在编译期决定的，因此如果在只有一个参数的时候调用该模板，if语句中的print也会被实例化，会出现报错。
+
+从17开始，出现了折叠表达式，可以用来计算参数包（可以有初始值）中所有参数运算结果的二元运算符，比如有如下的代码：
+
+```c++
+template<typename… T>
+auto foldSum (T… s) {
+	return (… + s); // ((s1 + s2) + s3) …
+}
+```
+
+如果参数包是空的，这个表达式将不合规范（不过此时对于运算符&&，结果会是true，对于||，结果会是false，对于逗号运算符，结果会是void()）。以下是可能的折叠表达式：
+
+![fold_expression](..\image\template\fold_expression.png)
+
+几乎所有的二元表达式都可以用于折叠表达式。
+
+变参模块的应用很广泛，经常使用移动语义对象对参数进行完美转发，通常像如下声明：
+
+```c++
+namespace std {
+template<typename T, typename… Args> shared_ptr<T>
+make_shared(Args&&… args);
+class thread {
+public:
+    template<typename F, typename… Args>
+    explicit thread(F&& f, Args&&… args);
+    …
+};
+template<typename T, typename Allocator = allocator<T>>
+class vector {
+public:
+    template<typename… Args>
+    reference emplace_back(Args&&… args);
+    …
+};
+}
+```
+
+注意常规模板参数的规则同样适用于变参模板参数，比如参数是按值传递，参数会被拷贝，类型也会退化，如果引用传递，那么参数会是实参的引用且类型不会退化。
+
+除了转发所有参数之外，还可以做些别的事情，比如计算它们的值：
+
+```c++
+template<typename... T>
+void printDouble(T const&... args) {
+	print(args + args...);
+}
+```
+
+先翻倍，再调用print，如果是向每个参数加1，则可以如下做：
+
+```c++
+template<typename… T>
+void addOne (T const&… args)
+{
+    print (args + 1…); // ERROR: 1… is a literal with too many decimal points
+    print (args + 1 …); // OK
+	print ((args + 1)…); // OK
+}
+```
+
+编译阶段的表达式同样可以这样做：
+
+```c++
+template<typename T1, typename… TN>
+constexpr bool isHomogeneous (T1, TN…)
+{
+	return (std::is_same<T1,TN>::value && …); // since C++17
+}
+```
+
+还可以通过变参下标来访问相应的元素，比如：
+
+```c++
+template<typename C, typename... Idx>
+void printElems(C const& coll, Idx... idx)
+{
+	print(coll[idx]...);
+}
+std::vector<std::string> coll = {"good", "times", "say", "bye"};
+printElems(coll,2,0,3);
+```
+
+也可以将非类型模板参数声明成参数包：
+
+```c++
+template<std::size_t... Idx, typename C>
+void printIdx(C const& coll)
+{
+	print(coll[Idx]...);
+}
+std::vector<std::string> coll = {"good", "times", "say", "bye"};
+printIdx<2,0,3>(coll);
+```
+
+类模板也可以是变参的，一个例子是通过任意多个模板参数指定了class相应数据成员的类型，如：
+
+```c++
+template<typename… Elements>class Tuple;
+Tuple<int, std::string, char> t; // t can hold integer, string, and
+character
+```
+
+另一个例子是指定对象可能包含的类型：
+
+```c++
+template<typename… Types>
+class Variant;
+Variant<int, std::string, char> v; // v can hold integer, string, or character
+```
+
+还可以将class定义成一组下标的类型，如下使用：
+
+```c++
+// type for arbitrary number of indices:
+template<std::size_t…>
+struct Indices {
+};
+template<typename T, std::size_t… Idx>
+void printByIdx(T t, Indices<Idx…>)
+{
+	print(std::get<Idx>(t)…);
+}
+std::array<std::string, 5> arr = {"Hello", "my", "new", "!", "World"};
+printByIdx(arr, Indices<0, 4, 3>());
+//或者如下使用
+auto t = std::make_tuple(12, "monkeys", 2.0);
+printByIdx(t, Indices<0, 1, 2>());
+```
+
+推断指引也可以是变参的，比如C++中，为std::array定义了如下的推断指引：
+
+```c++
+namespace std {
+	template<typename T, typename... U> array(T, U...)
+	->array<enable_if_t<(is_same_V<T, U>&& ...), T>, (1+sizeof...(U))>;
+}
+```
+
+针对这样的初始化`std::array a{42, 45, 77}`，会将指引中的T推断为array的首元素的类型，而U...会被推断为剩余元素的类型。其中有一个折叠表达式，可以展开为：
+
+```c++
+is_same_v<T, U1> && is_same_v<T, U2> && is_same_v<T, U3> ...
+```
+
+还可以用来定义变参基类，示例如下：
+
+```c++
+#include <string>
+#include <unordered_set>
+class Customer
+{
+private:
+	std::string name;
+public:
+    Customer(std::string const& n) : name(n) { }
+    std::string getName() const { return name; }
+};
+struct CustomerEq {
+    bool operator() (Customer const& c1, Customer const& c2) const {
+    return c1.getName() == c2.getName();
+}
+};
+struct CustomerHash {
+    std::size_t operator() (Customer const& c) const {
+    return std::hash<std::string>()(c.getName());
+}
+};
+// define class that combines operator() for variadic base classes:
+template<typename… Bases>
+struct Overloader : Bases…
+{
+	using Bases::operator()…; // OK since C++17
+};
+int main()
+{
+    // combine hasher and equality for customers in one type:
+    using CustomerOP = Overloader<CustomerHash,CustomerEq>;
+    std::unordered_set<Customer,CustomerHash,CustomerEq> coll1;
+    std::unordered_set<Customer,CustomerOP,CustomerOP> coll2;
+    …
+}
+```
+
+## 基础技巧
+
+typename用来澄清模板内部的一个标识符代表的是某种类型，而不是数据成员。
