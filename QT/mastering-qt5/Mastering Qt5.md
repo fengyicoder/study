@@ -692,6 +692,146 @@ ToolBar {
 
 qml单例需要显式导入才能加载qmldir文件，所以这里使用了import "."。
 
+## 第六章 Even Qt Deserves a Slice of Raspberry Pi
+
+ 本章主要包括以下内容：
+
+- Qt3D模块的架构；
+- 交叉编译的原则；
+- 如何建立自己的Qt Creator工具包以及在Raspberry Pi上部署自己的游戏；
+- 如何处理各平台的差异和限制；
+- 工厂模式；
+- 如何使用JavaScript和qml完成一个游戏引擎；
+- QML profiler的使用；
+
+要渲染一个3D的红苹果，大致需要以下的组件：
+
+- 一个网格组件，保存苹果的顶点；
+- 一个材料组件，在网格上应用纹理或者为其着色；
+
+Qt3D类没有继承自Item，因此不能直接与QML的组件一起使用。QNode类是所有Qt3D node类的基类，其依赖QObject类来定义亲子关系，每个QNode类还有一个唯一标识自己的id变量。
+
+虽然QNode不能直接与Qt Quick类型一起使用，但它们可以被添加进Q3DScene元素（或者Qml中的Scene3D ）中，Q3DScene作为它们的容器，可以添加到Qt Quick Item中。
+
+以下来展示相关的示例，main.cpp如下：
+
+```c++
+#include <QGuiApplication>
+#include <QtQui/QOpenGLContext>
+#include <QtQuick/QQuickView>
+#include <QtQml/QQmlEngine>
+
+int main(int argc, char *argv[])
+{
+//    QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+
+    QGuiApplication app(argc, argv);
+    qputenv("QT3D_GLSL100_WORKAROUND", "");
+    QSurfaceFormat format;
+    if (QOpenGLContext::openGLModuleType() == 
+            QOpenGLContext::LibGL) {
+        format.setVersion(3, 2);
+        format.setProfile(QSurfaceFormat::CoreProfile);
+    }
+    format.setDepthBufferSize(24);
+    format.setStencilBufferSize(8);
+    
+    QQuickView view;
+    view.setFormat(format);
+    view.setResizeMode(QQuickView::SizeRootObjectToView);
+    QObject::connect(view.engine(), &QQmlEngine::quit,
+                     &app, &QGuiApplication::quit);
+    view.setSource(QUrl("qrc:/main.qml"));
+    view.show();
+
+    return app.exec();
+}
+```
+
+利用 QSurfaceFormat来处理OpenGL以定制化QQuickView view。
+
+GameArea.qml文件定义如下：
+
+```c++
+import Qt3D.Core 2.0
+import Qt3D.Render 2.0
+import Qt3D.Extras 2.0
+import QtQuick 2.6 as QQ2
+
+Entity {
+    id: root
+    property alias gameRoot: root
+    Camera {
+        id: camera
+        property real x: 24.5
+        property real y: 14.0
+        projectionType: CameraLens.PerspectiveProjection
+        fieldOfView: 45
+        aspectRatio: 16/9
+        nearPlane: 0.1
+        farPlane: 1000.0
+        position: Qt.vector3d(x, y, 33.0)
+        upVector: Qt.vector3d(0.0, 1.0, 0.0)
+        viewCenter: Qt.vector3d(x, y, 0.0)
+    }
+
+    RenderSettings {
+        id: frameFraph
+        activeFrameGraph: ForwardRenderer {
+            clearColor: Qt.rgba(0, 0, 0, 1)
+            camera: camera
+        }
+    }
+
+    KeyboardDevice {
+        id: keyboardController
+    }
+
+    InputSettings {
+        id: inputSettings
+    }
+
+    KeyboardHandler {
+        id: input
+        sourceDevice: keyboardController
+        focus: true
+        onPressed: {}
+    }
+    
+    QQ2.Component.onCompleted: {
+        console.log("Start game...");
+        timer.start()
+    }
+    
+    QQ2.Timer {
+        id: timer
+        interval: initialTimeInterval
+        repeat: true
+        onTriggered: {}
+    }
+
+    components: [frameFraph, input]
+
+}
+```
+
+## 第七章 Third-Party Libraries Without a Headache
+
+本章目的是创建一个qt design可以使用的插件，其配置文件示例如下：
+
+```c++
+QT += widgets uiplugin
+CONFIG += plugin
+CONFIG += c++14
+TEMPLATE = lib 
+DEFINES += FILTERPLUGINDESIGNER_LIBRARY
+
+TARGET = $$qtLibraryTarget($$TARGET)
+INSTALLS += target
+```
+
+其中QT和CONFIG中的uiplugin和plugin都是必须的。默认情况下，我们的TARGET是filter-plugin-designer，`$$qtLibraryTarget()`函数会根据我们的平台来更新，比如window下会添加后缀d。最后，将target添加到INSTALLS这里，主要是为了把生成的library文件安装到特定文件夹。
+
 
 
 ## 第九章 Keeping Your Sanity with Multithreading
