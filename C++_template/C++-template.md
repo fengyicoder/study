@@ -1076,4 +1076,467 @@ int main()
 
 ## 基础技巧
 
-typename用来澄清模板内部的一个标识符代表的是某种类型，而不是数据成员。
+### typename关键字
+
+typename用来澄清模板内部的一个标识符代表的是某种类型，而不是数据成员。通常来说，一个类型依赖于模板参数，就必须用typename。使用typename的一种场景是用来声明泛型代码中标准容器的迭代器：
+
+```c++
+typename T::const_iterator pos;
+typename T::const_iterator end(coll.end())
+```
+
+### 零初始化
+
+对于基础类型，比如int、double以及指针类型，由于它们没有默认构造函数，因此不会被默认初始化一个有意义的值。比如任何未被初始化的局部变量都是未定义的：
+
+```c++
+void foo()
+{
+int x; // x has undefined value
+int* ptr; // ptr points to anywhere (instead of nowhere)
+}
+```
+
+因此在定义模板时，如果想要一个模板类型的变量被初始化成一个默认值，那么只是简单的定义是不够的，因为对内置类型，它们不会被初始化：
+
+```c++
+template<typename T>
+void foo()
+{
+    T x; // x has undefined value if T is built-in type
+}
+```
+
+因此，对于内置类型，最好显式调用其默认构造函数来将它们初始化为0，比如：
+
+```c++
+template<typename T>
+void foo()
+{
+	T x{}; // x is zero (or false) if T is a built-in type
+}
+```
+
+这种初始化的方法叫做值初始化，要么调用一个对象的已有的构造函数，要么就用0来初始化这个对象，即使它有显式的构造函数也是如此。
+
+在11之前，确保一个对象得到显式初始化的方式是：
+
+```c++
+T x = T(); // x is zero (or false) if T is a built-in type
+```
+
+在17之前，只有在与拷贝初始化对应的构造函数没有被声明为explicit的时候，这一方法才有效，从17开始，由于强制拷贝省略（比如RVO和右值拷贝优化）的使用，这一限制被解除，因此17之后两种方法都有效，但使用花括号初始化的情况，如果没有可用的默认构造函数，还可以使用列表初始化构造函数。从11开始也可以使用这种方式对非静态成员进行默认初始化：
+
+```c++
+template<typename T>
+class MyClass {
+private:
+	T x{};
+}
+```
+
+但不可以对默认参数使用这一方式：
+
+```c++
+template<typename T>
+void foo(T p{}) { //ERROR …
+}
+template<typename T>
+void foo(T p = T{}) { //OK (must use T() before C++11) …
+}
+```
+
+### 使用this->
+
+对于类模板，如果其基类也是依赖于模板参数的，即使x是继承而来的，使用this->x和x也不一定等效，比如：
+
+```c++
+template<typename T>
+class Base {
+public:
+	void bar();
+};
+template<typename T>
+class Derived: Base<T> {
+public:
+	void foo() {
+		bar(); //calls external bar() or error
+	}
+}
+```
+
+派生类中的bar()永远不会被解析成基类中的bar()，目前建议当使用定义于基类中的、依赖于模板参数的成员时，用this->或者Base<T>::来修饰。
+
+### 使用裸数组或者字符串常量的模板
+
+当向模板传递裸数组或者字符串常量时，需要格外注意以下的内容，第一如果参数是按引用传递，那么参数类型不会退化，也就是说，传递"hello"时模板类型会被推断为char const[6]，只有当按值传递时类型才会退化，会被推断为char const*。不过也可以定义如下专门处理裸数组或字符串的模板：
+
+```c++
+template<typename T, int T, int M>
+bool less(T(&a)[N], T(&b)[M])
+{
+	for (int i = 0; i<N && i<M; ++i)
+    {
+    if (a[i]<b[i]) return true; if (b[i]<a[i]) return false;
+    }
+    return N < M;
+}
+```
+
+当这样使用该模板时：
+
+```c++
+int x[] = {1, 2, 3};
+int y[] = {1, 2, 3, 4, 5};
+std::cout << less(x,y) << ’\n
+```
+
+less<>中的T会被实例化成int，N被实例化成3，M被实例化为5。
+
+### 成员模板
+
+一般来说，举例，即使两个stack的元素类型之家可以隐式转换，它们也不能互相赋值，除非将赋值运算符也定义成模板，如下：
+
+```c++
+template<typename T>
+class Stack {
+private:
+	std::deque<T> elems;
+public:
+	void push(T const&);
+	void pop();
+	T const& top() const;
+	bool empty() const {
+		return elems.empty();
+	}
+	template<typename T2>
+	Stack& operator=(Stack<T2> const&);
+}
+```
+
+新的赋值运算符被定义成下面这样：
+
+```c++
+template<typename T>
+template<typename T2>
+Stack<T>& Stack<T>::operator=(Stack<T2> const& op2)
+{
+	Stack<T2> tmp(op2);
+	elems.clear();
+	while(!tmp.empty()) {
+		elems.push_front(tmp.top());
+		tmp.pop();
+	}
+	return *this;
+}
+```
+
+为了访问op2的私有成员，可以将其他所有类型的stack模板的实例都定义成友元：
+
+```c++
+template<typename T>
+class Stack {
+private:
+	std::deque<T> elems; // elements
+public:
+    Void push(T const&); // push element
+    void pop(); // pop element
+    T const& top() const; // return top element
+    bool empty() const { // return whether the stack is empty
+   		return elems.empty();
+    }
+    // assign stack of elements of type T2
+    template<typename T2>
+    Stack& operator= (Stack<T2> const&);
+    // to get access to private members of Stack<T2> for any type T2:
+    template<typename> friend class Stack;
+};
+```
+
+可以将赋值运算符进一步省略：
+
+```c++
+template<typename T>
+template<typename T2>
+Stack<T>& Stack<T>::operator=(Stack<T2> const& op2)
+{
+	elems.clear();
+	elems.insert(elems.begin(), op2.elems.begin(), op2.elems.end());
+	return *this;
+}
+```
+
+现在，以下的代码就是合法的：
+
+```c++
+Stack<int> intStack;
+Stack<float> floatStack;
+...
+floatStack = intStack;
+```
+
+同样，也可以将内部的容器类型参数化，如下：
+
+```c++
+template<typename T, typename Cont = std::deque<T>>
+class Stack {
+private:
+	Cont elems; // elements
+public:
+    void push(T const&); // push element
+    void pop(); // pop element
+    T const& top() const; // return top element
+    bool empty() const { // return whether the stack is empty
+   		return elems.empty();
+    }
+    // assign stack of elements of type T2
+    template<typename T2, typename Cont2>
+    Stack& operator= (Stack<T2,Cont2> const&);
+    // to get access to private members of Stack<T2> for any type T2:
+    template<typename, typename> friend class Stack;
+};
+```
+
+此时的赋值运算符为：
+
+```c++
+template<typename T, typename Cont>
+template<typename T2, typename Cont2>
+Stack<T,Cont>& Stack<T,Cont>::operator= (Stack<T2,Cont2> const& op2)
+{
+    elems.clear(); // remove existing elements
+    elems.insert(elems.begin(), // insert at the beginning
+    op2.elems.begin(), // all elements from op2
+    op2.elems.end());
+    return *this;
+}
+```
+
+成员函数模板也可以被全部或部分特例化，比如：
+
+```c++
+class BoolString {
+private:
+	std::string value;
+public:
+	BoolString(std::string const& s): value(s) {}
+	template<typename T=std::string> T get() const {
+		return value;
+	}
+};
+```
+
+可以像下面这样对成员函数模板get进行全特例化：
+
+```c++
+template<>
+inline bool BoolString::get<bool>() const {
+	return value == "true" || value == "1" || value == "on";
+}
+```
+
+**注意**，我们不需要也不能对特例化的版本进行声明，只能定义它们。由于这是一个定义于头文件中的全实例化的版本（相当于常规函数），如果有多个编译单元include这个头文件，为避免重复定义的错误，必须将其定义为inline的。可以像如下使用：
+
+```c++
+std::cout << std::boolalpha;
+BoolString s1("hello");
+std::cout << s1.get() << ’\n’; //prints hello
+std::cout << s1.get<bool>() << ’\n’; //prints false
+BoolString s2("on");
+std::cout << s2.get<bool>() << ’\n’; //prints true
+```
+
+如果能够通过特殊成员函数copy或者move对象，那么相应的特殊成员函数（copy构造函数以及move构造函数）也将可以被模板化，和前面的赋值运算符相似，构造函数也可以是模板，但构造函数模板或者赋值运算符模板不会取代预定义的构造函数和赋值运算符，比如在上面的例子中，如果相同类型的stack之间相互赋值，调用的依然是默认赋值运算符。
+
+某些情况下，在调用成员模板的时候需要显式的指定其模板参数的类型，这时候就需要关键字tempalte来确保符号<会被理解成为模板参数列表的开始，而不是一个比较运算符，例如：
+
+```c++
+template<unsigned long N>
+void printBitset (std::bitset<N> const& bs) {
+	std::coout << bs.template to_string<char, std::char_traits<char>, std:;allocator<char>>();
+}
+```
+
+如果没有.template的话，编译器会将to_string()后面的<符号理解成小于运算符，而不是模板参数列表的开始，这种情况只会在点号前面的对象依赖于模板参数的时候才会发生。.template标识符（->template和::template也类似）只能用于模板内部，并且它前面的对象应该依赖于模板参数。
+
+14中引入的泛型lambdas，是一种成员模板的简化。比如以下的泛型lambda：
+
+```c++
+[] (auto x, auto y) {
+	return x + y;
+}
+```
+
+编译器会默认构造成下面这样一个类：
+
+```c++
+class SomeCompilerSpecificName {
+public:
+    SomeCompilerSpecificName(); // constructor only callable by
+    compiler
+    template<typename T1, typename T2>
+    auto operator() (T1 x, T2 y) const {
+    	return x + y;
+    }
+};
+```
+
+### 变量模板
+
+从14开始，变量也可以被某种类型参数化，被称为变量模板，如下：
+
+```c++
+template<typename T>
+constexpr T pi{3.1415926};
+```
+
+注意，和其他几种模板类似，这个定义最好不要出现在函数内部或者块作用域内部。在使用变量模板的时候，必须指明它们的类型：
+
+```c++
+std::cout << pi<double> << '\n';
+std::cout << pi<float> << '\n'; 
+```
+
+变量模板也可以用于不同编译单元：
+
+```c++
+template<typename T> T val{}; // zero initialized value//== translation
+unit 1:
+#include "header.hpp"
+int main()
+{
+    val<long> = 42;
+    print();
+}
+//== translation unit 2:
+#include "header.hpp"
+void print()
+{
+	std::cout << val<long> << ’\n’; // OK: prints 42
+}
+```
+
+也可以有默认模板类型：
+
+```c++
+template<typename T = long double> 
+constexpr T pi = T{3.14159};
+...
+std::cout << pi<> << ’\n’; //outputs a long double
+std::cout << pi<float> << ’\n’; //out
+```
+
+但不能省略尖括号。
+
+同样，也可以用非类型参数对变量模板进行参数化，也可以将非类型参数用于参数器的初始化，如：
+
+```c++
+#include <iostream>
+#include <array>
+template<int N>
+std::array<int,N> arr{}; // array with N elements, zero-initialized
+template<auto N>
+constexpr decltype(N) dval = N; // type of dval depends on passed value
+int main()
+{
+	std::cout << dval<’c’> << ’\n’; // N has value ’c’ of type ch
+	arr<10>[0] = 42; // sets first element of global arr
+    for (std::size_t i=0; i<arr<10>.size(); ++i) { // uses values set in arr
+   	 std::cout << arr<10>[i] << ’\n’;
+    }
+}
+```
+
+变量模板的一种应用场景是用于定义代表类模板成员的变量模板，比如如果定义了一个这样的类模板：
+
+```c++
+template<typename T>
+class MyClass {
+public:
+	static constexpr int max = 1000;
+}
+```
+
+那么就可以为MyClass的不同特例化版本定义不同的值：
+
+```c++
+template<typename T>
+int myMax = MyClass<T>::max;
+```
+
+那么就有以下的使用方法：
+
+```c++
+auto i = myMax<std::string>;
+//而不用
+auto i = MyClass<std::string>::max;
+```
+
+类型萃取Suffix_v，从17开始，标准库用变量模板为其用来产生一个值（布尔型）的类型萃取定义了简化方式：
+
+```c++
+std::is_const_v<T>
+//而不用
+std::is_const<T>::value
+```
+
+主要是标准库做了如下定义：
+
+```c++
+namespace std {
+    template<typename T>
+    constexpr bool is_const_v = is_const<T>::value;
+}
+```
+
+### 模板参数模板
+
+还可以定义模板参数模板，比如：
+
+```c++
+template<typename T,
+template<typename Elem> class Cont = std::deque>
+class Stack {
+private:
+    Cont<T> elems; // elements
+public:
+    void push(T const&); // push element
+    void pop(); // pop element
+    T const& top() const; // return top element
+    bool empty() const { // return whether the stack is empty
+        return elems.empty();
+    } …
+};
+```
+
+从11开始，可以用别名模板取代Cont，但直到17才可以用typename取代class，如：
+
+```c++
+template<typename T, template<typename Elem> typename Cont =
+std::deque>
+class Stack { //ERROR before C++17 …
+};
+```
+
+由于模板参数模板中的模板参数没有被用到，作为惯例可以省略它。
+
+如果直接使用这个新版的Stack可能会遇到错误，原因是17之前要求template<typename Elem> typename Cont = std::deque中的模板参数必须和实际参数（deque）的模板参数匹配，作为变通，可以如下定义：
+
+```c++
+template<typename T, template<typename Elem,
+typename Alloc = std::allocator<Elem>> class Cont = std::deque>
+class Stack {
+private:
+    Cont<T> elems; // elements …
+};
+```
+
+## 移动语义和enable_if<>
+
+### 完美转发
+
+希望将被传递的参数的基本特性转发出去：
+
+- 可变对象被转发之后依旧是可变的；
+- const对象被转发之后依旧是const的；
+- 

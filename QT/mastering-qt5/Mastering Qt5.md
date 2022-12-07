@@ -1305,3 +1305,395 @@ inline std::unique_ptr<std::vector<std::unique_ptr<Message>>> readMessages(QData
 }
 ```
 
+## 第十一章 Having Fun with Serialization
+
+QVariant可用来进行数据的序列化，可通过variant.toX()这样的语法进行多种数据类型的转换。当在variant中储存值时，其被储存在一个私有的union中，如下：
+
+```c++
+union Data
+{
+    char c;
+    uchar uc;
+    short s;
+    signed char sc;
+    ushort us;
+    ...
+    qulonglong ull;
+    QObject *o;
+    void *ptr;
+    PrivateShared *shared;
+} data;
+```
+
+注意到列表的末尾，包含复杂的类型QObject\*与void\*。我们可以使用Q_DECLARE_METATYPE(SoundEvent)来注册自定义类型，此时，QVariant也变得可用。以下是QVariant与其他类型的转换：
+
+```c++
+SoundEvent soundEvent(4365, 0);
+QVariant stored;
+stored.setValue(soundEvent);
+SoundEvent newEvent = stored.value<SoundEvent>();
+qDebug() << newEvent.timestamp;
+```
+
+QVariant也有一个缺点，那就是它没法处理json与xml这种数据，这种时候就可以使用QVariantMap了，其只是QMap\<QString, QVariant\>的typedef。其使用示例如下：
+
+```c++
+QVariant SoundEvent::toVariant() const
+{
+    QVariantMap map;
+    map.insert("timestamp", timestamp);
+    map.insert("soundId", soundId);
+    return map;
+}
+void SoundEvent::fromVariant(const QVariant& variant)
+{
+    QVariantMap map = variant.toMap();
+    timestamp = map.value("timestamp").toLongLong();
+    soundId = map.value("soundId").toInt();
+}
+
+QVariant Track::toVariant() const
+{
+    QVariantMap map;
+    map.insert("duration", mDuration);
+    QVariantList list;
+    for (const auto& soundEvent : mSoundEvents) {
+    	list.append(soundEvent->toVariant());
+    }
+    map.insert("soundEvents", list);
+    return map;
+}
+void Track::fromVariant(const QVariant& variant)
+{
+    QVariantMap map = variant.toMap();
+    mDuration = map.value("duration").toLongLong();
+    QVariantList list = map.value("soundEvents").toList();
+    for(const QVariant& data : list) {
+        auto soundEvent = make_unique<SoundEvent>();
+        soundEvent->fromVariant(data);
+        mSoundEvents.push_back(move(soundEvent));
+    }
+}
+```
+
+对于json文件，qt提供了一个QJsonDocument类来读写json文件，注意，此类只接受QVariantMap、QVariantList或QStringList数据类型，以下是一个简单的示例：
+
+```c++
+void JsonSerializer::save(const Serializable& serializable,
+const QString& filepath, const QString& /*rootName*/)
+{
+    QJsonDocument doc =
+    QJsonDocument::fromVariant(serializable.toVariant());
+    QFile file(filepath);
+    file.open(QFile::WriteOnly);
+    file.write(doc.toJson());
+    file.close();
+}
+
+void JsonSerializer::load(Serializable& serializable,
+const QString& filepath)
+{
+    QFile file(filepath);
+    file.open(QFile::ReadOnly);
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    file.close();
+    serializable.fromVariant(doc.toVariant());
+}
+```
+
+toJson方法转换成UTF-8编码。
+
+对于xml文件，xml表示如下：
+
+```c++
+<[name]> type="[type]">[data]</[name]>
+```
+
+一个示例如下：
+
+```c++
+void XmlSerializer::writeVariantValueToStream(
+const QVariant& variant, QXmlStreamWriter& stream)
+{
+	stream.writeCharacters(variant.toString());
+}
+void XmlSerializer::writeVariantListToStream(
+const QVariant& variant, QXmlStreamWriter& stream)
+{
+    QVariantList list = variant.toList();
+    for(const QVariant& element : list) {
+    	writeVariantToStream("item", element, stream);
+    }
+}
+void XmlSerializer::writeVariantMapToStream(
+const QVariant& variant, QXmlStreamWriter& stream)
+{
+    QVariantMap map = variant.toMap();
+    QMapIterator<QString, QVariant> i(map);
+    while (i.hasNext()) {
+        i.next();
+        writeVariantToStream(i.key(), i.value(), stream);
+    }
+}
+
+QVariant XmlSerializer::readVariantValueFromStream(
+QXmlStreamReader& stream)
+{
+    QXmlStreamAttributes attributes = stream.attributes();
+    QString typeString = attributes.value("type").toString();
+    QString dataString = stream.readElementText();
+    QVariant variant(dataString);
+    variant.convert(QVariant::nameToType(
+    typeString.toStdString().c_str()));
+    return variant;
+}
+
+QVariant XmlSerializer::readVariantListFromStream(QXmlStreamReader& stream)
+{
+    QVariantList list;
+    while(stream.readNextStartElement()) {
+    	list.append(readVariantFromStream(stream));
+    }
+    return list;
+}
+
+QVariant XmlSerializer::readVariantMapFromStream(
+QXmlStreamReader& stream)
+{
+    QVariantMap map;
+    while(stream.readNextStartElement()) {
+        map.insert(stream.name().toString(),
+        readVariantFromStream(stream));
+    }
+    return map;
+}
+
+void XmlSerializer::writeVariantToStream(const QString& nodeName,
+const QVariant& variant, QXmlStreamWriter& stream)
+{
+    stream.writeStartElement(nodeName);
+    stream.writeAttribute("type", variant.typeName());
+    switch (variant.type()) {
+        case QMetaType::QVariantList:
+            writeVariantListToStream(variant, stream);
+            break;
+        case QMetaType::QVariantMap:
+            writeVariantMapToStream(variant, stream);
+            break;
+        default:
+            writeVariantValueToStream(variant, stream);
+            break;
+    }
+    stream.writeEndElement();
+}
+
+QVariant XmlSerializer::readVariantFromStream(QXmlStreamReader& stream)
+{
+    QXmlStreamAttributes attributes = stream.attributes();
+    QString typeString = attributes.value("type").toString();
+    QVariant variant;
+    switch (QVariant::nameToType(
+        typeString.toStdString().c_str())) {
+        case QMetaType::QVariantList:
+            variant = readVariantListFromStream(stream);
+            break;
+        case QMetaType::QVariantMap:
+            variant = readVariantMapFromStream(stream);
+            break;
+        default:
+            variant = readVariantValueFromStream(stream);
+            break;
+    }
+    return variant;
+}
+
+void XmlSerializer::save(const Serializable& serializable, const QString&
+filepath, const QString& rootName)
+{
+    QFile file(filepath);
+    file.open(QFile::WriteOnly);
+    QXmlStreamWriter stream(&file);
+    stream.setAutoFormatting(true);
+    stream.writeStartDocument();
+    writeVariantToStream(rootName, serializable.toVariant(),
+    stream);
+    stream.writeEndDocument();
+    file.close();
+}
+
+void XmlSerializer::load(Serializable& serializable,
+const QString& filepath)
+{
+    QFile file(filepath);
+    file.open(QFile::ReadOnly);
+    QXmlStreamReader stream(&file);
+    stream.readNextStartElement();
+    serializable.fromVariant(readVariantFromStream(stream));
+}
+
+```
+
+最后是处理二进制文件，如下：
+
+```c++
+void BinarySerializer::save(const Serializable& serializable,
+const QString& filepath, const QString& /*rootName*/)
+{
+    QFile file(filepath);
+    file.open(QFile::WriteOnly);
+    QDataStream dataStream(&file);
+    dataStream << serializable.toVariant();
+    file.close();
+}
+void BinarySerializer::load(Serializable& serializable, const QString& filepath)
+{
+    QFile file(filepath);
+    file.open(QFile::ReadOnly);
+    QDataStream dataStream(&file);
+    QVariant variant;
+    dataStream >> variant;
+    serializable.fromVariant(variant);
+    file.close();
+}
+
+```
+
+
+
+## 第十二章 You Shall (Not) Pass with QTest
+
+一个测试工程的配置文件示例如下：
+
+```c++
+QT += core gui multimedia widgets testlib
+CONFIG += c++14 console
+TARGET = drum-machine-test
+TEMPLATE = app
+include(../drum-machine-src.pri)
+DRUM_MACHINE_PATH = ../drum-machine
+INCLUDEPATH += $$DRUM_MACHINE_PATH
+DEPENDPATH += $$DRUM_MACHINE_PATH
+SOURCES += main.cpp
+```
+
+从上面可以看出，需要对testlib进行使能。
+
+Qt的Test基于以下的设定：
+
+- 一个测试用例就是一个QObject类；
+- 一个私有槽函数就是一个测试函数；
+- 一个测试用例可以包含多个测试函数；
+
+但需要注意以下名字的私有槽函数不是测试函数：
+
+- initTestCase()：在第一个测试函数之前调用；
+- init()：在每个测试函数之前调用；
+- cleanup()：在每个测试函数之后调用；
+- cleanupTestCase()：在最后一个测试函数之后调用；
+
+QVERIFY可以用来执行数据之间的比对，比如QVERIFY(data == DUMMY_FILE_CONTENT)。但其实也可以用QCOMPARE()，比如QCOMPARE(dummy.myInt, 1)。
+
+QTest还提供另一个有趣的宏，QTEST_MAIN，其可以产生完成的main函数，使用方法如下：
+
+```c++
+QTEST_MAIN(TestJsonSerializer)
+#include "testjsonserializer"
+```
+
+注意，使用了QTEST_MAIN宏之后要移除自己的main函数，不然main函数会有两份。
+
+如果想要自定义主函数，示例如下：
+
+```c++
+#include "TestJsonSerializer.h"
+int main(int argc, char *argv[])
+{
+    TestJsonSerializer test;
+    QStringList arguments = QCoreApplication::arguments();
+    return QTest::qExec(&test, arguments);
+}
+```
+
+有时我们有测试不同输入的需要，那么给xxx()输入数据的函数必须命名为xxx_data()，如下：
+
+```c++
+class TestTrack : public QObject
+{
+	Q_OBJECT
+public:
+	explicit TestTrack(QObject *parent = 0);
+private slots:
+    void addSoundEvent_data();
+    void addSoundEvent();
+};
+
+void TestTrack::addSoundEvent_data()
+{
+    QTest::addColumn<int>("trackState");
+    QTest::addColumn<int>("soundEventCount");
+    QTest::newRow("STOPPED")
+    << static_cast<int>(Track::State::STOPPED)
+    << 0;
+    QTest::newRow("PLAYING")
+    << static_cast<int>(Track::State::PLAYING)
+    << 0;
+    QTest::newRow("RECORDING")
+    << static_cast<int>(Track::State::RECORDING)
+    << 1;
+}
+
+void TestTrack::addSoundEvent()
+{
+    QFETCH(int, trackState);
+    QFETCH(int, soundEventCount);
+    Track track;
+    switch (static_cast<Track::State>(trackState)) {
+        case Track::State::STOPPED:
+            track.stop();
+            break;
+        case Track::State::PLAYING:
+            track.play();
+            break;
+        case Track::State::RECORDING:
+            track.record();
+            break;
+        default:
+            break;
+    }
+    track.addSoundEvent(0);
+    track.stop();
+    QCOMPARE(track.soundEvents().size(),
+    static_cast<size_t>(soundEventCount));
+}
+
+
+```
+
+其中，QFETCH(int, trackState)做了两件事，第一件事是声明trackState的类型为int，第二件事是匹配当前列的数据并将其存储在trackState中。
+
+QBENCHMARK这个宏定义用于基准测试，使用示例如下：
+
+```c++
+QBENCHMARK {
+	mSerializer.save(track, FILENAME);
+}
+```
+
+如果进行基准测试的时候不想迭代多次，可以使用QBENCHMARK_ONCE。
+
+QTest还提供了对信号进行监视的测试，使用的是QSignalSpy这个类，使用如下：
+
+```c++
+void TestGui::playSound()
+{
+	SoundEffectWidget widget;
+	QSignalSpy spy(&widget, &SoundEffectWidget::soundPlayed);
+	widget.setId(2);
+	widget.play();
+	QCOMPARE(spy.count(), 1);
+	QList<QVariant> arguments = spy.takeFirst();
+	QCOMPARE(arguments.at(0).toInt(), 2);
+}
+```
+
+需要使用要监视对象的指针和要监视的信号来初始化QSignalSpy这个类，发射信号的参数被储存在一个QVariantList中。

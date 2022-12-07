@@ -117,6 +117,4 @@ addr.sin_port = htons(atoi(serv_port));
 
 ## 基于TCP的服务器端/客户端
 
-有以下示意图：
-
-![](..\image\TCPIP\TCPIP.png)
+其TCP/IP协议栈共分4层，最上层为应用层，之后是TCP层与UDP层，再之后是IP层，最后是链路层。
