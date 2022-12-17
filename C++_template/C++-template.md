@@ -2,7 +2,7 @@
 
 C++模板主要是为了泛型存在的，避免了重复造轮子。模板是为了一种或多种未明确定义的类型而定义的函数或类，在使用模板时，需要显式或隐式的指定模板参数。由于模板是C++语言特性，因此支持类型和作用域检查。
 
-## 第一章 函数模板
+## 函数模板
 
 函数模板是被参数化的函数，因此是具有相似功能的函数族。
 
@@ -316,7 +316,7 @@ int main()
 
 通常而言，函数模板不需要被声明成inline，因为其也可以定义在头文件中被多个编译单元include，唯一一个例外，是模板对某些类型的全特化，留待下文进行讨论。
 
-## 第二章 类模板
+## 类模板
 
 在类的内部，使用类型时不带<T>代表类型和模板类的参数类型相同，如下：
 
@@ -1539,4 +1539,449 @@ private:
 
 - 可变对象被转发之后依旧是可变的；
 - const对象被转发之后依旧是const的；
-- 
+- 可移动对象被转发以后依旧是可移动的；
+
+实现完美转发的惯用方法如下：
+
+```c++
+template<typename T>
+void f(T&& val) {
+	g(std::forward<T>(val));
+}
+```
+
+只有当val是右值时，forward才将其转发为右值，否则则什么都不做。注意这里模板的T&&，其跟具体类型的右值引用是不一样的：
+
+- 具体类型的X的X&&声明了一个右值引用参数，只能被绑定到一个可移动的对象上，它的值总是可变的，而且总是可以被窃取的；
+- 模板参数T的T&&声明了一个转发引用（也成万能引用），可以被绑定到可变、不可变（比如const）或者可移动对象上；
+
+### 特殊成员函数模板
+
+特殊成员函数比如构造函数都可以是模板：
+
+```c++
+#include <utility>
+#include <string>
+#include <iostream>
+class Person
+{
+private:
+    std::string name;
+public:
+    // generic constructor for passed initial name:
+    template<typename STR>
+    explicit Person(STR&& n) : name(std::forward<STR>(n)) {
+    	std::cout << "TMPL-CONSTR for ’" 
+    }
+    // copy and move constructor:
+    Person (Person const& p) : name(p.name) {
+    	std::cout << "COPY-CONSTR Person ’" << name << "’\n";
+    }
+    Person (Person&& p) : name(std::move(p.name)) {
+    	std::cout << "MOVE-CONSTR Person ’" << name << "’\n";
+    }
+};
+```
+
+注意：
+
+```c++
+std::string s = "sname";
+Person p1(s); // init with string object => calls TMPL-CONSTR
+Person p2("tmp"); //init with string literal => calls TM
+Person p3(p1); // ERROR
+Person p4(std::move(p1)); // OK: move Person => calls MOVECONST
+Person const p2c("ctmp"); //init constant object with string literal
+Person p3c(p2c); // OK: copy constant Person => calls COPY
+```
+
+这是因为根据C++重载解析规则，对于一个非const左值的Person p，成员模板Person(STR&& n)比预定义的拷贝构造函数Person(Person const& p)更匹配，这里STR可以直接被替换成Person&，但对于拷贝构造函数还需要做进一步的const转换。提供一个非const的拷贝构造可以解决，但更好的解决办法是当参数是一个Person对象或一个可以转换为Person对象的表达式时，不要启动模板，可以用std::enable_if<>实现。
+
+### 通过std::enable_if<>禁用模板
+
+比如函数模板定义如下：
+
+```c++
+template<typename T>
+typename std::enable_if<(sizeof(T) > 4)>::type
+foo() {
+}
+```
+
+std::enable_if<>是一种类型萃取，它会根据一个作为其（第一个）模板参数的编译器表达式决定其行为：
+
+- 如果表达式结果为真，它的type成员会返回一个类型作为返回类型，如果没有第二个模板参数，返回类型是void，否则返回类型是第二个参数的类型；
+- 如果表达式结果是false，则其成员类型是未定义的，根据模板的SFINAE的规则，包含std::enable_if<>表达式的函数模板被忽略掉；
+
+从14开始的所有模板萃取都返回一个类型，因此可以使用一个与之对应的别名模板std::enable_if_t<>，这样就可以省略掉template和::type，如下：
+
+```c++
+template<typename T>
+std::enable_if_t<sizeof(T) > 4>
+foo() {
+}
+```
+
+由于将enable_if表达式放在声明的中间不是一个明智的做法，因此使用std::enable_if<>的更常见的方法是使用一个额外的、有默认值的模板参数：
+
+```c++
+template<typename T, typename = std::enable_if_t<(sizeof(T) > 4)>>
+void foo() {
+}
+```
+
+如果认为这依然不够明智，并且希望模板的约束更加明显，可以用别名模板定义别名：
+
+```c++
+template<typename T>
+using EnableIfSizeGreater4 = std::enable_if_t<(sizeof(T) > 4)>;
+template<typename T, typename = EnableIfSizeGreater4<T>>
+void foo() {}
+```
+
+### 使用enable_if<>
+
+接下来可以解决我们的问题，当传递的模板参数类型不正确的时候（比如不是std::string或者可以转换成std::string类型）将对应的构造函数模板禁用，此时需要使用另一个标准库的类型萃取std::is_convertiable<FROM, TO>。在17中相应的构造函数模板定义为：
+
+```c++
+template<typename STR, typename = std::enable_if_t<std::is_convertiable_v<STR, std::string>>>
+Person(STR&& n);
+```
+
+注意14中由于没有给产生一个值的类型萃取定义带_v的别名，必须使用如下的定义：
+
+```c++
+template<typename T>
+using EnableIfString = std::enable_if_t<std::is_convertiable<T, std::string>::value>;
+```
+
+而在11中由于没有类型萃取定义带_t的别名，必须使用如下定义：
+
+```c++
+template<typename T>
+using EnableIfString = typename std::enable_if<std::is_convertiable<T, std::string>::value>::type;
+```
+
+除了使用要求类型之间可以隐式转换的std::is_convertible<>之外，还可以使用std::is_constructible<>，它要求可以用显式转换来做初始化，它的参数顺序和std::is_convertible<>相反：
+
+```c++
+template<typename T>
+using EnableIfString = std::enable_if_t<std::is_constructible_v<std::string, T>>;
+```
+
+注意我们不能通过使用enable_if<>来禁用copy/move构造函数以及赋值构造函数，这是因为成员函数模板不会被算作特殊成员函数（依然会生成默认构造函数）。可以采用这样的办法，定义一个接收const volatile的copy构造函数并标识为delete，这样做就不会再隐式声明一个接收const参数的copy构造函数，在此基础上，可以定义一个函数模板，对于nonvolatile的类型（对于volitile类型会报错），它会被优先选择：
+
+```c++
+class C
+{
+public:
+	C(C const volatile&) == delete;
+	template<typename T>
+	C(T const&) {
+		std::cout << "tmpl copy constructor\n";
+	}
+}
+```
+
+这样就可以对这个copy构造函数模板添加限制，比如：
+
+```c++
+template<typename U, typename=std::enable_if_t<!std::is_integral<U>::value>>
+C (C<U> const &) {};
+```
+
+### 使用concept简化enable_if<>表达式
+
+在C++20中，可以写出如下的代码：
+
+```c++
+template<typename STR>
+requires std::is_convertible_v<STR, std::string>
+Person(STR&& n): name(std::forward<STR>(n)) {}
+```
+
+甚至可以将其中模板的使用条件定义成通用的concept：
+
+```c++
+template<typename T>
+concept ConvertibleToString = std::is_convertible_v<T, std::string>;
+template<typename STR>
+requires ConvertibleToString<STR>
+Person(STR&& n): name(std::forward<STR>(n)) {}
+```
+
+## 按值引用还是按引用传递
+
+自从11引入了移动语义之后，共有以下的传递方式：
+
+1. X const&：const左值引用；
+2. X&：非const左值引用；
+3. X&&：右值引用；
+
+对具体的类型，决定参数的方式已经很复杂，在参数未知的模板中，选择就更加困难，在前文中，曾建议模板中优先使用按值传递，除非遇到以下情况：
+
+- 对象不允许copy；
+- 参数被用于返回数据；
+- 参数以及所有属性需要被模板转发到别的地方；
+- 可以获得明显的性能提升；
+
+### 按值传递
+
+按值传递调用拷贝构造的成本可能很高，所以可以通过移动语义优化掉对象的拷贝。注意，不是所有的情况都会调用拷贝构造函数：
+
+```c++
+std::string returnString();
+std::string s = "hi";
+printV(s); //copy constructor
+printV(std::string("hi")); //copying usually optimized away (if not,
+move constructor)
+printV(returnString()); // copying usually optimized away (if not, move
+constructor)
+printV(std::move(s)); // move construct
+```
+
+第二次和第三次调用传递的参数是纯右值，编译器会优化参数传递，从17开始，标准要求这一方案必须被实现，而在17之前，如果编译器没有优化这一类的拷贝，则至少应该尝试移动语义。
+
+注意，按值传递还有一个特性，那就是参数类型会退化，裸数组会退化成指针，const和volatile等限制符会被删除（只会删除顶层const）。
+
+### 按引用传递
+
+按引用传递不一定能够提高性能，原因在于底层实现上按引用传递实际上通过传递参数的地址实现的，地址会被简单编码，从而提高调用者向被调用者传递的效率，但按地址传递可能使得编译器在编译调用者代码时有一些困惑，那就是被调用者会怎么处理这个地址，由于被调用者可能利用这个地址来随意更改其中的内容，因此编译器假设在这次调用之后，缓存中缓存器的值全部变为无效，而重新载入这些变量的值可能会很耗时（可能比拷贝对象的成本要高）。设为const引用能否被编译器识别从而阻止以上的过程？答案是不能，编译器并不能做这样的推断。不过对于inline函数，情况可能会好一些，编译器可以展开inline函数，那么就可以基于调用者和被调用者信息推断被传递地址中的值十分会被修改。
+
+如果是按const引用传递，比如如下的模板：
+
+```c++
+template<typename T>
+void printR (T const& arg) { …
+}
+std::string const c = "hi";
+printR(c); // T deduced as std::string, arg is std::string const&
+printR("hi"); // T deduced as char[3], arg is char const(&)[3]
+int arr[4];
+printR(arr); // T deduced as int[4], arg is int const(&)[4]
+```
+
+显然类型不会退化，而且推断T也不含const。
+
+如果想要按非const引用传递，就需要使用非const引用（或指针），比如：
+
+```c++
+template<typename T>
+void outR (T& arg) { 
+    …
+}
+```
+
+这种情况，通常不允许将临时变量或者通过move处理过的已存在变量用作其参数：
+
+```c++
+std::string returnString();
+std::string s = "hi";
+outR(s); //OK: T deduced as std::string, arg is std::string&
+outR(std::string("hi")); //ERROR: not allowed to pass a temporary (prvalue)
+outR(returnString()); // ERROR: not allowed to pass a temporary (prvalue)
+outR(std::move(s)); // ERROR: not allowed to pass an xv
+```
+
+但以下的情况有些复杂：
+
+```c++
+std::string const c = "hi";
+outR(c); // OK: T deduced as std::string const
+outR(returnConstString()); // OK: same if returnConstString() returns const string
+outR(std::move(c)); // OK: T deduced as std::string const
+outR("hi"); // OK: T deduced as char const[3]
+```
+
+也就是说，当传递的参数是const时，arg的类型有可能被推断为const引用，这时可以传递一个右值作为参数，但模板其实期望的是左值。在上面的情况中，在函数模板内部，任何试图更改被传递参数的值的行为都是错误的。如果想要禁止向非const引用传递const对象，有以下的选择：
+
+- 使用static_assert触发一个编译期错误：
+
+  ```c++
+  template<typename T>
+  void outR(T& arg) {
+  	static_assert(!std::is_const<T>::value, "out parameter of foo<T>(T&) is const");
+  	...
+  }
+  ```
+
+- 通过使用std::enable_if<>禁用该情况模板：
+
+  ```c++
+  template<typename T, typename=std::enable_if_t<!std::is_const<T>::value>>
+  void outR(T& arg) {
+  	...
+  }
+  ```
+
+  或者在concepts被支持之后使用concepts：
+
+  ```c++
+  template<typename T>
+  requires !std::is_const_v<T>
+  void outR(T& arg) {
+  	...
+  }
+  ```
+
+对于按转发引用传递参数，考虑以下的代码：
+
+```c++
+std::string s = "hi";
+passR(s); // OK: T deduced as std::string& (also the type of arg)
+passR(std::string("hi")); // OK: T deduced as std::string, arg is
+// std::string&&
+passR(returnString()); // OK: T deduced as std::string, arg is
+// std::string&&
+passR(std::move(s)); // OK: T deduced as std::string, arg is
+// std::string&&
+passR(arr); // OK: T deduced as int(&)[4] (also the type of arg)
+```
+
+可以将任意类型的参数传递给转发引用，而且也不会被拷贝。
+
+然而，以下的类型推断有点特殊：
+
+```c++
+std::string const c = "hi";
+passR(c); //OK: T deduced as std::string const&
+passR("hi"); //OK: T deduced as char const(&)[3] (also the type of arg)
+// int arr[4];
+passR(arr); //OK: T deduced as int (&)[4] (also the type of arg)
+```
+
+在以上三种情况下，都可以在passR的内部从arg的类型得知参数是一个右值还是一个const或者非const的左值。
+
+转发引用虽然完美，也有缺点，由于其是唯一一个可以将模板参数T隐式推断为引用的情况，如果在模板内部直接用T声明一个未初始化的局部变量，就会触发错误（引用对象在创建时必须被初始化）：
+
+```c++
+template<typename T>
+void passR(T&& arg) { // arg is a forwarding reference
+	T x; // for passed lvalues, x is a reference, which requires an initializer …
+}
+foo(42); // OK: T deduced as int
+int i;
+foo(i); // ERROR: T deduced as int&, which makes the declaration of x
+// in passR() invalid
+```
+
+### 使用std::ref()和std::cref()（限于模板）
+
+可以使用\<functional\>中的std::ref()和std::cref()将参数按引用传递给模板：
+
+```c++
+template<typename T>
+void printT (T arg) { 
+    …
+}
+std::string s = "hello";
+printT(s); //pass s By value
+printT(std::cref(s)); // pass s “as if by reference”
+```
+
+std::cref并没有改变函数模板内部处理参数的方式，它只是用一个行为和引用类似的对象对参数进行了封装。事实上，其会创建一个std::reference_wrapper<>对象，该对象引用了原始参数，并按值传递给模板。该对象可能只支持一个操作：向原始类型的隐式类型转换，返回原始参数对象。注意，编译器必须知道需要将std::reference_wrapper<>对象转换为原始参数类型才会进行隐式转换，因此其通常只有在通过泛型代码传递对象时才正常工作，比如直接尝试输出T，就会因为std::reference_wrapper没有定义输出操作符而报错。
+
+### 处理字符串常量和裸数组
+
+有时候可能必须要对数组参数和指针参数做不同的实现，当然这样的情况下不能退化数组的类型，为了区分这两种情况，必须要检测被传递过来的参数是不是数组，通常有两种方法：
+
+- 可以将模板定义成只接受数组作为参数：
+
+  ```c++
+  template<typename T, std::size_t L1, std::size_t L2>
+  void foo(T (&arg1)[L1], T (&arg2)[L2])
+  {
+      T* pa = arg1; // decay arg1
+      T* pb = arg2; // decay arg2
+      if (compareArrays(pa, L1, pb, L2)) { 
+      	…
+      }
+  }
+  ```
+
+- 可以使用类型萃取来检测参数是不是数组：
+
+  ```c++
+  template<typename T, typename =
+  std::enable_if_t<std::is_array_v<T>>>
+  void foo (T&& arg1, T&& arg2)
+  {
+  	…
+  }
+  ```
+
+这些特殊的处理方式过于复杂，最好还是利用不同的函数名来专门处理数组参数，或者更进一步，让模板调用者使用std::vector或者std::array作为参数。
+
+### 处理返回值
+
+有一些情况也倾向于按引用返回：
+
+- 返回容器或者字符串中的元素（比如通过[]运算符或者front方法访问元素）；
+- 允许修改类对象的成员；
+- 为链式调用返回一个对象（比如>>和<<运算符以及赋值运算符）
+
+但最好还是确保函数模板采用按值返回的方式，使用函数模板T作为返回类型并不能保证返回值不会是引用，因为T在某些情况下会被隐式推断为引用类型，比如：
+
+```c++
+template<typename T>
+T retR(T&& p) // p is a forwarding reference
+{
+	return T{…}; // OOPS: returns by reference when called for lvalues
+}
+```
+
+即使函数模板声明为按值传递，也可以显式将T指定为引用类型：
+
+```c++
+template<typename T>
+T retV(T p) //Note: T might become a reference
+{
+	return T{…}; // OOPS: returns a reference if T is a reference
+}
+int x;
+retV<int&>(x); // retT() instantiated for T as in
+```
+
+为安全起见，有以下两种选择：
+
+- 用类型萃取std::remove_reference\<T\>将T转为非引用类型：
+
+  ```c++
+  template<typename T>
+  typename std::remove_reference<T>::type retV(T p)
+  {
+  	return T{...};
+  }
+  ```
+
+  std::decay<>之类的类型萃取可能也有帮助，因为它们也会隐式的去掉类型的引用；
+
+- 将返回值声明为auto，从而让编译器推断返回类型，因为auto会导致类型退化：
+
+  ```c++
+  template<typename T>
+  auto retV(T p) // by-value return type deduced by compiler
+  {
+  	return T{…}; // always returns by value
+  }
+  ```
+
+### 关于模板参数声明的推荐方法
+
+有以下两种情况：
+
+- 将参数声明按值传递，会对字符串常量和裸数组的类型进行退化，但对比较大的对象可能会影响性能。这种情况下，调用者仍能够通过std::cref和std::ref按引用传递参数；
+- 将参数声明按引用传递，对比较大的对象能够提供比较好的性能，尤其是在以下的情况下：
+  - 将已经存在的对象按照左值引用传递；
+  - 将临时对象或者被move转换为可移动的对象按右值引用传递；
+  - 或者将以上几种类型的对象按照转发引用传递；
+
+一般来说，对函数模板有以下建议：
+
+1. 默认情况下，将参数声明为按值传递，这样比较简单，对于字符串常量也可以正常工作，对于临时对象性能也不错，对于比较大的对象，为了避免成本高昂的拷贝，可以使用ref和cref；
+2. 如果理由充分也可以不这样做：需要一个参数用于输出；使用模板是为了转发它的参数，那么就使用完美转发；重点考虑程序性能，而参数拷贝的成本又很高，那么就使用const应用。
+
+另外，如无必要，不要过分泛型化。
+
+## 编译期编程
+
