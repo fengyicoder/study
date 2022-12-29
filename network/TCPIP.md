@@ -500,5 +500,543 @@ sigaction(SIGALRM, &act, 0);
 
 ### 分割TCP的I/O程序
 
+即客户端的父进程负责接收数据，额外创建的子进程负责发送数据，分割后，不同进程分别负责输入和输出，这样，无论客户端是否接收完数据都可以进行传输。分割I/O程序还有两一个好处，那就是可以提高频繁交换数据的程序性能。示例如下：
 
+```c++
+pid = fork();
+if (pid == 0) write_routine(sock buf);
+else read_routine(sock, buf);
+
+void read_routine(int sock, char* buf) {
+	while(1) {
+		int str_len = read(sock, buf, BUF_SIZE);
+		if (str_len == 0) return;
+		buf[str_len] = 0;
+		printf("Message from server:%s", buf);
+	}
+}
+
+void write_routine(int sock, char* buf) {
+    while(1) {
+        fgets(buf, BUF_SIZE, stdin);
+        if(!strcmp(buf, "q\n") || !strcmp(buf, "Q\n")) {
+            shutdown(sock, SHUT_WR);
+            return;
+        }
+        write(sock, buf, strlen(buf));
+    }
+}
+```
+
+## 进程间通信
+
+进程间通信可以使用管道，管道并非属于进程，而是和套接字一样属于操作系统，以下是创建管道的api：
+
+```c++
+#include<unistd.h>
+int pipe(int filedes[2]);
+```
+
+其中filedes[0]是通过管道接收数据时使用的文件描述符，即管道出口，filedes[1]是通过管道传输数据时使用的文件描述符，即管道入口，使用示例如下：
+
+```c++
+#include <stdio.h>
+#include <unistd.h>
+#define BUF_SIZE 30
+
+int main(int argc, char* argv[]) {
+	int fds[2];
+	char str[] = "Who are you?";
+	char buf[BUF_SIZE];
+	pid_t pid;
+	pipe(fds);
+	pid = fork();
+	if (pid == 0) write(fds[1], str, sizeof(str));
+	else {
+		read(fds[0], buf, BUF_SIZE);
+		puts(buf);
+	}
+}
+```
+
+当然，也可以通过1个通道进行双向通信，比如：
+
+```c++
+#include <stdio.h>
+#include <unistd.h>
+#define BUF_SIZE 30
+
+int main(int argc, char* argv[]) {
+	int fds[2];
+	char str1[] = "Who are you?";
+	char str2[] = "Thank you for your message";
+	char buf[BUF_SIZE];
+	pid_t pid;
+	pipe(fds);
+	pid = fork();
+	if (pid == 0) {
+		write(fds[1], str1, sizeof(str1));
+		sleep(2);
+		read(fds[0], buf, BUF_SIZE);
+		printf("Child proc output: %s\n", buf);
+	}
+	else {
+		read(fds[0], buf, BUF_SIZE);
+		printf("Parent proc output: %s \n", buf);
+		write(fds[1], str2, sizeof(str2));
+		sleep(3);
+	}
+	return 0;
+}
+```
+
+注意，如果将`sleep(2);`注释掉，将会发生错误，因为向管道传递数据时，先读的进程会把数据取走，如果注释掉上述的那行代码，则父进程调用read函数后将无限期等待数据进入管道，因此，最好使用两个管道进行双向通信，如下：
+
+```c++
+#include <stdio.h>
+#include <unistd.h>
+#define BUF_SIZE 30
+
+int main(int argc, char* argv[]) {
+	int fds1[2]， fds2[2];
+	char str1[] = "Who are you?";
+	char str2[] = "Thank you for your message";
+	char buf[BUF_SIZE];
+	pid_t pid;
+	pipe(fds1), pipe(fds2);
+	pid = fork();
+	if (pid == 0) {
+		write(fds1[1], str1, sizeof(str1));
+		read(fds2[0], buf, BUF_SIZE);
+		printf("Child proc output: %s\n", buf);
+	}
+	else {
+		read(fds1[0], buf, BUF_SIZE);
+		printf("Parent proc output: %s \n", buf);
+		write(fds2[1], str2, sizeof(str2));
+		sleep(3);
+	}
+	return 0;
+}
+```
+
+## I/O复用
+
+模型中引入复用技术，可以减少进程数，即使用一个进程向多个客户端提供服务。
+
+### 理解select函数并实现服务器端
+
+运行select函数是最具有代表性的实现复用服务器端的方法，使用select函数时可以将多个文件描述符集中到一起同一监视，其调用过程如下所示：
+
+![select](..\image\Network\select.png)
+
+使用select可以同时监视多个文件描述符，当然也可以视为监视套接字，使用时将要监视的文件描述符集中到一起，需要按照监视项（接收、传输、异常）来区分，将监视项分成三类，使用fd_set数组变量执行此项操作，要监视哪一个文件描述符，就将哪个文件描述符代表的位置为1。在fd_set中注册或更改值的操作都由以下宏来操作：
+
+- FD_ZERO(fd_set *fdset)：将fd_set变量的所有位初始化为0；
+- FD_SET(int fd, fd_set* fdset)：在参数fdset指向的变量中注册文件描述符fd的信息；
+- FD_CLR(int fd, fd_set *fdset)：从参数fdset指向的变量中清除文件描述符fd的信息；
+- FD_ISSET(int fd, fd_set* fdset)：若参数fdset指向的变量中包含文件描述符fd的信息，则返回真；
+
+功能如下：
+
+![fd_set_function](..\image\Network\fd_set_function.png)
+
+select的api如下所示：
+
+```c++
+#include <sys/select.h>
+#include <sys/time.h>
+
+int select(int maxfd, fd_set* readset, fd_set* writeset, fd_set* exceptset, const struct timeval* timeout);
+```
+
+由于每次新建文件描述符，其值都会+1，因此maxfd可只设置为最大的文件描述符+1，因为文件描述符从0开始。另外如何知道哪些文件描述符发生了变化，可以通过那些文件描述符集合来看，其值没有置零就是发生了变化，即发生了监视的事件。以下是调用的示例：
+
+```c++
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#define BUF_SIZE 30
+
+int main() {
+	fd_set reads, temps;
+	int result, str_len;
+	char buf[BUF_SIZE];
+	struct timeval timeout;
+	FD_ZERO(&reads);
+	FD_SET(0, &reads);
+	timeout.tv_sec = 5; 
+	timeout.tv_usec = 5000;
+	while(1) {
+		temps = reads;
+		timeout.tv_sec = 5;
+		timeout.tv_usec = 0;
+		result = select(1, &temps, 0, 0, &timeout);
+		if (result == -1) {
+			puts("select() error");
+			break;
+		}
+		else if(result == 0) {
+			puts("Time-out");
+		}
+		else {
+			if(FD_ISSET(0, &temps)) {
+				str_len = read(0, buf, BUF_SIZE);
+				buf[str_len] = 0;
+				printf("message from console: %s", buf);
+			}
+		}
+	}
+	return 0;
+}
+```
+
+## 多种I/O函数
+
+### send&recv函数
+
+linux的相关api如下：
+
+```c++
+#include <sys/socket.h>
+ssize_t send(int sockfd, const void* buf, size_t nbytes, int flags);
+ssize_t recv(int sockfd, void* buf, size_t nbytes, int flags);
+```
+
+其中flag是可选项，有以下的种类和含义：
+
+![send&recv](..\image\Network\send&recv.png)
+
+其中，MSG_OOB用于发送紧急消息，使用示例如下：
+
+```c++
+send(sock, "4", strlen("4"), MSG_OOB);
+...
+fcntl(recv_sock, F_SETOWN, getpid());
+state = sigaction(SIGURG, &act, 0);
+
+void urg_handler(int signo) {
+	int str_len;
+	char buf[BUF_SIZE];
+	str_len = recv(recv_sock, buf, sizeof(buf)-1, MSG_OOB);
+	buf[str_len] = 0;
+	printf("Urgent message: %s\n", buf);
+}
+```
+
+当收到MSG_OOB紧急消息时，操作系统会产生SIGURG信号，并调用注册的信号处理函数，至于fcntl函数，其用于控制文件描述符，上述代码中将recv_sock的所有权指派给了把getid函数返回值用作ID的进程。然而，通过这个选项，并不能加快数据传输速度，而且信号处理函数urg_handle也只能读一个字节，剩余的字节只能通过未设置MSG_OOB的普通读取函数读取。MSG_OOB的真正意义在于督促数据接收对象尽快处理数据。
+
+同时设置MSG_PEEK和MSG_DONTWAIT选项，以验证输入缓冲中是否存在接收的数据，设置MSG_PEEK选项并调用recv函数时，即使读取了输入缓冲的数据也不会删除，因此，常与MSG_DONTWAIT合作，用于调用非阻塞方式验证待读数据存在与否的函数。
+
+### readv&writev函数
+
+通过writev，可以将分散保存在多个缓冲的数据一起发送，通过readv，可以由多个缓冲分别接收，因此，适当使用这两个函数可以减少I/O函数的调用次数。相关api如下：
+
+```c++
+#include <sys/uio.h>
+ssize_t writev(int filedes, const struct iovec* iov, int iovcnt);
+ssize_t readv(int filedes, const struct iovec* iov, int iovcnt);
+struct iovec {
+    void* iov_base; //缓冲地址
+    size_t iov_len;  //缓冲大小
+}
+```
+
+## 多播与广播
+
+多播方式的数据传输是基于UDP完成的，其与UDP服务端/客户端的区别在于，UDP数据传输以单一目标进行，多播则可以同时向多个主机传递数据。多播的数据传输特点如下所示：
+
+- 多播服务器针对特定多播组，只发送1次数据；
+- 即使只发送一次数据，该组内所有客户端都可以收到数据；
+- 多播组数可在IP地址范围内任意增加；
+- 加入特定组即可接收发往该多播组的数据；
+
+多播适合向大量客户端发送相同数据，例如多媒体的实时传输。为了传递多播数据包，必须设置TTL（Time to Live，生存时间）。TTL用整数表示，每经过一个路由器就减一，当TTL变为0时该数据包就不会被传输而是会销毁。与设置TTL相关的协议层为IPPROTO_IP，选项名为IP_MULTICAST_TTL，示例如下：
+
+```c++
+int send_sock;
+int time_live = 64;
+...
+send_sock = socket(PF_INET, SOCK_DGRAM, 0);
+setsockopt(send_sock, IPPROTO_IP, IP_MULTICAST_TTL, (void*)&time_live, sizeof(time_live));
+```
+
+加入多播组也通过设置套接字选项完成：
+
+```c++
+int recv_sock;
+struct ip_mreq join_adr;
+recv_sock = socket(PF_INET, SOCK_DGRAM, 0);
+...
+join_adr.imr_muttiaddr.s_addr = "多播组地址信息"；
+join_adr.imr_interface.s_addr = "加入多播组的主机地址信息"；
+setsockopt(recv_sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (void*)&join_adr, sizeof(join_adr));
+
+...
+struct ip_mreq {
+    struct in_addr imr_multiaddr; //组ip地址
+    struct in_addr imr_interface; //加入该组的套接字所属主机的IP地址，也可以使用INADDR_ANY
+}
+```
+
+### 广播
+
+广播也是一次性向多个主机发送数据，但其只能向同一网络中的主机传输数据。广播也是基于UDP完成的，根据传输数据时使用的IP地址的形式，分为直接广播和本地广播。二者的差别主要在ip地址，直接广播的ip地址除了网络地址外，其余主机地址全部设置为1，反之，本地广播中使用的ip地址限定为255.255.255.255。使用如下：
+
+```c++
+int send_sock;
+int bcast = 1;  //对变量初始化以将SO_BRADACAST选项设置为1
+...
+send_sock = socket(PF_INET, SOCK_DGRAM, 0);
+...
+setsockopt(send_sock, SOL_SOCKET, SO_BRODACAST, (void*)&bcast, sizeof(bcast));
+```
+
+## 套接字和标准IO
+
+标准IO函数具有以下的优点：具有良好的移植性；可以利用缓冲提高性能。使用示例如下：
+
+```c++
+#include <stdio.h>
+#define BUF_SIZE 3
+
+int main(int argc, char* argv[]) {
+	FILE *fp1;
+	FILE *fp2;
+	char buf[BUF_SIZE];
+	fp1 = fopen("new.txt", "r");
+	fp2 = fopen("copy.txt", "w");
+	while (fgets(buf, BUF_SIZE, fp1)!=NULL) {
+		fputs(buf, fp2);
+	}
+	fclose(fp1);
+	fclose(fp2);
+	return 0;
+}
+```
+
+当然，标准IO也有缺点：不容易进行双向通信；有时可能频繁调用fflush函数；需要以FILE结构体指针形式返回文件描述符。
+
+### 使用标准io函数
+
+创建套接字会返回文件描述符，为了使用标准IO函数，需要先将其转换为FILE结构体指针，可使用如下api：
+
+```c++
+#include <stdio.h>
+FILE *fdopen(int fildes, const char* mode);
+```
+
+常用的参数模式有读模式r和写模式w，使用如下：
+
+```c++
+#include <stdio.h>
+#include <fcntl.h>
+
+int main(void) {
+	FILE *fp;
+	int fd = open("data.dat", O_WRONLY|O_CREAT|O_TRUNC);
+	if (fd == -1) {
+		fputs("file open error", stdout);
+		return -1;
+	}
+	fd = dfopen(fd, "w");
+	fputs("Network C programming\n", fp);
+	fclose(fp);
+	return 0;
+}
+```
+
+另外，还可以使用fileno将其转换会文件描述符：
+
+```c++
+#include <stdio.h>
+int fileno(FILE* stream);
+```
+
+实际使用如下：
+
+```
+...
+readfp = fdopen(clnt_sock, "r");
+writefp = fdopen(clnt_sock, "w");
+while(!feof(readfp)) {
+	fgets(message, BUF_SIZE, readfp);
+	fputs(message, writefp);
+	fflush(writefp);
+}
+```
+
+注意，由于标准IO函数内部提供了额外的缓冲，若不立即调用fflush函数，将无法保证数据立即传输到客户端。
+
+## 关于IO流分离的其他内容
+
+终止流时无法半关闭的原因：
+
+![FILE](..\image\Network\FILE.png)
+
+可见，读模式跟写模式的指针都是根据同一个文件描述符创建的，因此针对任意一个FILE指针调用fclose函数都会关闭文件描述符。既然如此，要怎么进入半关闭状态，方法是创建FILE指针先复制文件描述符即可：
+
+![FILE1](..\image\Network\FILE1.png)
+
+复制文件描述符可以使用以下两个函数之一：
+
+```c++
+#include <unistd.h>
+int dup(int fildes);
+int dup2(int fildes, int fildes2);
+```
+
+使用示例如下：
+
+```c++
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char* argv[]) {
+	int cfd1, cfd2;
+	char str1[] = "Hi~ \n";
+	char str2[] = "It's nice day~\n";
+	cfd1 = dup(1);
+	cfd2 = dup2(cfd1, 7);
+	printf("fd1=%d, fd2=%d\n", cfd1, cfd2);
+	write(cfd1, str1, sizeof(str1));
+	write(cfd2, str2, sizeof(str2));
+	close(cfd1);
+	close(cfd2);
+	write(1, str1, sizeof(str1));
+	close(1);
+	write(1, str2, sizeof(str1));
+	return 0;
+}
+```
+
+用这种方法实现流的分离：
+
+```c++
+...
+readfp = fdopen(clnt_sock, "r");
+writefp = fdopen(dup(clnt_sock), "w");
+fputs("xxxx", writefp);
+fflush(writefp);
+shutdown(fileno(writefp), SHUT_WR);
+fclose(writefp);
+fgets(buf, sizefo(buf), readfp);
+fputs(buf, stdout);
+fclose(readfp);
+...
+```
+
+## 优于select的epoll
+
+基于select的IO复用服务器端慢的原因主要有以下两点：调用select后常见的针对所有文件描述符的循环语句；每次调用select函数都需要向该函数传递监视对象的信息。而linux下的epoll具有克服select函数的优点：无需编写以监视状态为目的的针对所有文件描述符的循环语句；调用对应于select函数的epoll_wait时不需要每次传递监视对象信息。
+
+epoll服务器端实现需要以下三个函数：
+
+- epoll_create：创建保存epoll文件描述符的空间；
+- epoll_ctl：向空间注册并注销文件描述符；
+- epoll_wait：与select类似，等待文件描述符发生变化；
+
+相关的结构体如下：
+
+```c++
+struct epoll_event {
+	__uint32_t events;
+	epoll_data_t data;
+}
+
+typedef union epoll_data {
+	void *ptr;
+	int fd;
+	__uint32_t u32;
+	__uint64_t u64;
+}epoll_data_t;
+```
+
+epoll_create的api如下：
+
+```c++
+#include <sys/epoll.h>
+int epoll_create(int size);
+```
+
+调用此函数创建的文件描述符保存空间称为epoll例程，通过size参数来决定epoll例程的大小。epoll_create创建的资源与套接字相同，也由操作系统管理，也会返回文件描述符，因此终止时也需要close函数。
+
+生成epoll例程后需要注册需要监视对象文件描述符，api如下：
+
+```c++
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event* event);
+```
+
+示例如下：
+
+```c++
+epoll_ctl(A, EPOLL_CTL_ADD, B, C);
+epoll_ctl(A, EPOLL_CTL_DEL, B, NULL);
+```
+
+分别代表在epoll例程中注册和删除文件描述符B，C指的是要监视的事件。op有以下的选项：
+
+- EPOLL_CTL_ADD：将文件描述符注册到epoll例程；
+- EPOLL_CTL_DEL：从epoll例程中删除文件描述符；
+- EPOLL_CTL_MOD：更改注册的文件描述符的关键事件发生情况；
+
+epoll_event可以注册要关注的事件，使用如下：
+
+```c++
+struct epoll_event event;
+event.events = EPOLLIN;
+event.data.fd = sockfd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &event);
+```
+
+events中可以保存的常量及所指事件的类型有：
+
+- EPOLLIN：需要读取数据的情况；
+- EPOLLOUT：输出缓冲为空，可以立即发送数据的情况；
+- EPOLLPRI：收到OOB数据的情况；
+- EPOLLRDHUP：断开连接或者半关闭的情况；
+- EPOLLERR：发生错误的情况；
+- EPOLLET：以边缘触发的方式得到事件通知；
+- EPOLLONESHOT：发生一次事件后相应的文件描述符不再收到事件通知，因此需要EPOLL_CTL_MOD再次设置事件；
+
+最后一个api是：
+
+```c++
+#include <sys/epoll.h>
+int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout);
+```
+
+使用如下：
+
+```
+int event_cnt;
+struct epoll_event *ep_events;
+...
+ep_events = malloc(sizeof(struct epoll_event)*EPOLL_SIZE);
+...
+event_cnt = epoll_wait(epfd, ep_events, EPOLL_SIZE, -1);
+```
+
+### 条件触发和边缘触发
+
+条件触发方式中，只要输入缓冲中有数据就会一直通知该事件，而边缘触发中输入缓冲收到数据时仅注册一次该事件，即使输入缓冲中还有数据也不会再进行注册。
+
+epoll默认以条件触发方式工作，但也可按以下的方式更改换成以边缘触发的方式工作：
+
+```c++
+event.events = EPOLLIN|EPOLLET
+```
+
+下面介绍将套接字改为非阻塞方式的方法，linux可使用如下的方式来更改或读取文件属性：
+
+```c++
+int fcntl(int filedes, int cmd, ...);
+```
+
+使用如下：
+
+```c
+int flag = fcntl(fd, F_GETFL, 0);
+fcntl(fd, F_SETFL, flag|O_NONBLOCK);
+```
 
