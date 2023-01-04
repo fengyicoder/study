@@ -1985,3 +1985,114 @@ retV<int&>(x); // retT() instantiated for T as in
 
 ## 编译期编程
 
+模板的实例化发生在编译期间，可以和模板的某些特性相结合，能够产生一种C++自己内部的原始递归的“编程语言”。比如以下代码在编译期间就可以判断一个数是否是质数：
+
+```c++
+template<unsigned p, unsigned d> // p: number to check, d: current divisor
+struct DoIsPrime {
+	static constexpr bool value = (p%d != 0) && DoIsPrime<p, d-1>::value;
+};
+template<unsigned p> // end recursion if divisor is 2
+struct DoIsPrime<p, 2> {
+	static constexpr bool value = (p%2 != 0);
+};
+template<unsigned p> // primary template
+struct IsPrime {
+	// start recursion with divisor from p/2
+	static constexpr bool value = DoIsPrime<p, p/2>::value;
+};
+// special cases (to avoid endless recursion with template
+instantiation):
+template<>
+struct IsPrime<0> { static constexpr bool value = false; };
+template<>
+struct IsPrime<1> { static constexpr bool value = false; };
+template<>
+struct IsPrime<2> { static constexpr bool value = true; };
+template<>
+struct IsPrime<3> { static constexpr bool value = true; };
+```
+
+以9为例，表达式IsPrime<9>::value会首先展开成DoIsPrime<9, 4>::value，进一步展开成9%4!=0 && DoIsPrime<9,3>::value，然后进一步展开。这个过程都是在编译期间进行，最终IsPrime<9>::value会在编译期间被扩展成false。
+
+### 通过constexpr进行计算
+
+11引入了constexpr的特性，大大简化了各种类型的编译期计算。虽然11对其使用有着诸多限制（比如constexpr函数的定义通常都只能包含一个return语句），但14中大部分限制都被移除。目前，堆内存分配以及异常抛出还不被支持。
+
+在11中，判断一个数是否是质数的方法如下：
+
+```c++
+constexpr bool
+doIsPrime (unsigned p, unsigned d) // p: number to check, d: current
+divisor
+{
+    return d!=2 ? (p%d!=0) && doIsPrime(p,d-1) // check this and smaller
+    divisors
+    : (p%2!=0); // end recursion if divisor is 2
+}
+constexpr bool isPrime (unsigned p)
+{
+    return p < 4 ? !(p<2) // handle special cases
+    : doIsPrime(p,p/2); // start recursion with divisor from
+    p/2
+}
+```
+
+14中constexpr可以使用常规C++中大部分的控制结构，因此改进如下：
+
+```c++
+constexpr bool isPrime (unsigned int p)
+{
+    for (unsigned int d=2; d<=p/2; ++d) {
+    if (p % d == 0) {
+   		return false; // found divisor without remainder}
+    }
+    return p > 1; // no divisor without remainder found
+}
+```
+
+注意，可以在编译期执行并不一定在编译期执行，如果变量被constexpr修饰，或者被定义于全局作用域或namespace作用域，会在编译期内计算，如果定义于块作用域，那么将由编译器决定是否在编译期间进行计算。
+
+### 通过部分特例化来进行路径选择
+
+示例如下：
+
+```c++
+// primary helper template:
+template<int SZ, bool = isPrime(SZ)>
+struct Helper;
+// implementation if SZ is not a prime number:
+template<int SZ>
+struct Helper<SZ, false>
+{ …
+};
+// implementation if SZ is a prime number:
+template<int SZ>
+struct Helper<SZ, true>
+{ …
+};
+template<typename T, std::size_t SZ>
+long foo (std::array<T,SZ> const& coll)
+{
+    Helper<SZ> h; // implementation depends on whether array has prime number as size 
+    …
+}
+```
+
+上述针对两种可能的情况实现了两种偏特例化版本，也可以将主模板用于其中一种情况，再特例化一个版本代表另一种情况：
+
+```c++
+// primary helper template (used if no specialization fits):
+template<int SZ, bool = isPrime(SZ)>
+struct Helper
+{ …
+};
+// special implementation if SZ is a prime number:
+template<int SZ>
+struct Helper<SZ, true>
+{ …
+};
+```
+
+### SFINAE(Substitution Failure Is Not An Error，替换失败不是错误)
+
