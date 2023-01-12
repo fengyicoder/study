@@ -2096,3 +2096,90 @@ struct Helper<SZ, true>
 
 ### SFINAE(Substitution Failure Is Not An Error，替换失败不是错误)
 
+对于函数的重载，当函数调用的备选方案包括函数模板时，编译期首先要决定应该将什么样的模板参数用于各种模板方案，然后用这些参数替换函数模板的参数列表以及返回类型，最后评估替换后的函数模板和这个调用的匹配情况。这一过程可能会遇到问题：替换产生的结果可能没有意义。这一类型的替换不会导致错误，C++语言规则要求忽略掉这一类型的替换结果，这一原理称为SFINAE。有以下的例子：
+
+```c++
+template<typename T, unsigned N>
+std::size_t len(T(&)[N]) {
+	return N;
+}
+template<typename T>
+typename T::size_type len(T const& t) {
+	return t.size();
+}
+
+int a[10];
+std::cout << len(a); // OK: only len() for array matches
+std::cout << len("tmp"); //OK: only len() for array matches
+std::vector<int> v;
+std::cout << len(v); // OK: only len() for a type with size_type 
+int* p;
+std::cout << len(p); // ERROR: no matching len() function 
+```
+
+对于数组和字符串来说，其实对第二个函数模板也可以分别用int[10]和char const[4]来替换参数T，但这种替换在处理返回类型T::size_type时会导致错误，因此对于这种调用第二个函数模板会被忽略。
+
+如果忽略掉那些替换之后返回值无效的备选项，那么编译器会选择另外一个参数类型匹配相差的备选项，比如：
+
+```c++
+//对所有类型的应急选项：
+std::size_t len(...) {
+	return 0;
+}
+```
+
+额外提供了一个通用函数len，它总会匹配所有的调用，但其匹配情况也总是所有重载选项中最差的。
+
+对于有些限制条件，并不总是能够容易的设计出合适的表达式来SFINAE掉函数模板，比如有size_type成员但没有size成员函数的参数类型，这种情况函数模板可能会被选择并在实例化的过程中导致错误，如下：
+
+```c++
+template<typename T>
+typename T::size_type len(T const& t) {
+	return t.size();
+}
+std::allocator<int> x;
+std::cout << len(x) << ’\n’; //ERROR: len() selected, but x has no size()
+```
+
+处理这一情况有一种常用的模式：
+
+- 通过尾置返回类型语法指定返回类型（函数名前使用auto，函数名后使用->指定返回类型）；
+- 通过decltype和逗号运算符定义返回类型；
+- 将所有需要成立的表达式放在逗号运算符的前面（为了预防可能会发生的运算符被重载的情况，需要将这些表达式的类型转换为void）；
+- 在逗号运算符的末尾定义一个类型为返回类型的对象；
+
+比如：
+
+```c++
+template<typename T>
+auto len(T const& t) -> decltype((void)(t.size()), T::size_type())
+{
+	return t.size();
+}
+```
+
+这里返回类型被定义为`decltype((void)(t.size()), T::size_type())`，其操作数是一组用逗号隔开的表达式，因此最后一个表达式T::size_type()会产生一个类型为返回类型的对象（decltype会将其转换为返回类型）。而在最后一个逗号之前的表达式都必须成立，之所以将其类型转换为void，是为了避免用户重载了该表达式对应类型的逗号运算符而导致的不确定性。
+
+### 编译期if
+
+部分特例化、SFINAE以及std::enable_if可以一起被用来禁用或者启用某个模板，而C++17在此基础上引入了同样在编译期基于某些条件禁用或启用相应模板的编译期if语句。通过使用if constexpr()语法，编译器会根据编译期表达式来决定是使用if语句的then对应的部分还是else对应的部分。例如：
+
+```c++
+template<typename T, typename... Types>
+void print(T const& firstArg, Types const&... args) {
+	std::cout << firstArg << '\n';
+	if constexpr(sizeof...(args)>0) {
+		print(args...); //code only available if sizeof…(args)>0 (since
+C++17)
+	}
+}
+```
+
+## 在实践中使用模板
+
+### 包含模式
+
+对于模板来说，将模板声明和定义都放在头文件中的方法称为“包含模式”。
+
+### 模板和inline
+
