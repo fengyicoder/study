@@ -355,6 +355,28 @@ int setsockopt(int sock, int level, int optname, void* optval, socklen_t *optlen
 
 SO_RCVBUF是输入缓冲大小相关可选项，SO_SNDBUF是输出缓冲大小相关可选项，用这两个可选项既可以读取当前I/O缓冲大小，也可以更改。
 
+TCP连接中recv等函数默认为阻塞方式，即有数据到来之前函数不会返回，有时需要超时机制使得超时的时候函数也要返回，api如下：
+
+```c++
+int setsockopt(int s, int level, int optname, void* optval, socklen_t* optlen);
+```
+
+这里涉及到一个结构体：
+
+```c++
+struct timeval
+{
+	time_t tv_sec;  //毫秒
+	time_t tv_usec; //微秒
+}；
+```
+
+使用示例如下：
+
+```c++
+setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_out, sizeof(tv_out));
+```
+
 ### SO_REUSEADDR
 
 以下是time-wait状态下的套接字：

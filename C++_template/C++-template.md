@@ -2183,3 +2183,342 @@ C++17)
 
 ### 模板和inline
 
+inline可以提高程序运行性能，其告知编译器优先在函数调用处将函数体做inline替换展开，而不是按常规的调用机制。但编译期可能会忽视这一点，但避不开的是使用inline可以允许函数定义在函数中出现多次。函数模板也跟inline函数类似，其可以定义在头文件中，在多个编译单元中出现。但这不意味函数模板会在默认情况下使用inline替换，这由编译器决定。如果想要自己决定是否进行inline替换，有时候只能通过编译期的具体属性实现，比如noinline和always_inline。
+
+需要注意的是，函数模板在全特化之后和常规函数是一样的，除非其被定义为inline，否则只能被定义一次。
+
+### 预编译头文件
+
+编译器在编译头文件时有时需要耗费大量的时间，模板的引入则进一步加剧了这一问题，但编译期供应商提供了一种叫做预编译头文件的方案来降低预编译时间。
+
+预编译头文件的方案实现基于这样的事实：在组织代码的时候，很多文件都以相同的几行开始，这样就可以单独编译这几行，并将编译完成的状态保存在一个预编译头文件中，所以以这几行开始的文件在编译时都会载入这个保存的状态，之后接着编译，重新载入这几行的编译状态被重新编译这几行要快很多很多，因此要让尽可能多的文件以尽可能多的相同的代码作为开始。
+
+一种推荐的方式是创建一个通用的头文件，里面按层级组织，从最常用以及最稳定的头文件到那些期望一直都不会变化的头文件。
+
+## 模板的基本术语
+
+### 类模板还是模板类
+
+C++中，struct、classes和unions都被称为class types，需要注意的是class types包含unions，但class不包含。
+
+class template指的是这个类是模板，即它是一组class的参数化表达；而template class的含义更丰富些，用作类模板的同义词，也用作指代从template实例出的类，或者是用来指代名称是一个template-id（模板名+<模板参数>）的类。
+
+### 替换、实例化和特例化
+
+替换即用模板实参尝试替换模板参数。
+
+从一个模板创建一个常规类、类型别名、函数、成员函数或者变量的过程称为模板实例化。
+
+通过实例化或者不完全实例化产生的实体称为特例化。
+
+### 声明和定义
+
+声明是将一个名称引入到一个C++作用域，对于声明，如果细节已知或者是需要申请相关变量的存储空间，那么声明就变成了定义。对于一个类模板或者函数模板，如果有包含在{}中的主体的话，那么声明也会变成定义。
+
+类型可以是完整的或者非完整的，非完整类型是以下情况之一：
+
+- 一个被声明还没有被定义的class类型；
+- 一个没有指定边界的数组；
+- 一个存储非完整类型的数组；
+- void类型；
+- 一个底层类型未定义或者枚举值未定义的枚举类型；
+- 任何一个被const或者volatile修饰的以上某种类型；
+
+### 唯一定义法则
+
+- 常规非inline函数和成员函数以及非inline的全局变量和静态数据成员，在整个程序中只能被定义一次；
+- class类型（包括struct和union），模板（包含部分特例化但不能是全特例化）以及inline函数和变量，在一个编译单元只能被定义一次，而且不同编译单元的定义应该相同；
+
+在后面的章节中，可链接实体指的是以下任意一种：一个函数或成员函数，一个全局变量或静态数据成员，以及通过模板产生的类似实体，只要对linker可见即可。
+
+## 泛型库
+
+### 可调用对象
+
+C++中，一些类型既可以被作为函数调用参数使用，也可以按照f(...)的形式调用，因此可用作回调参数：
+
+- 函数指针类型；
+- 重载了operator()的class类型（有时被称为仿函数），这其中包含lambda函数；
+- 包含一个可以产生一个函数指针或者函数引用的转换函数的class类型；
+
+这样的类型统称为函数对象类型，其对应的值称为函数对象。
+
+将函数对象应用于参数有以下几种情况：
+
+```c++
+#include <iostream>#include <vector>
+#include "foreach.hpp"
+// a function to call:
+void func(int i)
+{
+	std::cout << "func() called for: " << i << ’\n’;
+}
+// a function object type (for objects that can be used as functions):
+class FuncObj {
+public:
+    void operator() (int i) const { //Note: const member function
+    std::cout << "FuncObj::op() called for: " << i << ’\n’;
+    }
+};
+int main()
+{
+    std::vector<int> primes = { 2, 3, 5, 7, 11, 13, 17, 19 };
+    foreach(primes.begin(), primes.end(), // range
+    func); // function as callable (decays to pointer)
+    foreach(primes.begin(), primes.end(), // range
+    &func); // function pointer as callable
+    foreach(primes.begin(), primes.end(), // range
+    FuncObj()); // function object as callable
+    foreach(primes.begin(), primes.end(), // range
+    [] (int i) { //lambda as callable
+    std::cout << "lambda called for: " << i << ’\n’;
+    });
+}
+
+```
+
+
+
+- 当把函数名当作函数参数传递时，并不是传递函数本体，而是传递其指针或者引用，当按值传递时，函数参数退化为指针，如果参数类型为模板参数，那么类型会被推断为指向函数的指针；和数组一样，按引用传递的函数类型不会退化，但函数类型不能真正用const限制，const会被省略；
+- 显式传递一个函数指针跟第一条情况相同；
+- 如果传递的是一个仿函数，就是将一个类的对象当作可调用对象进行传递，注意在定义operator的时候最好将其定义为const成员函数，否则一些框架或库不希望该调用会改变被传递对象的状态时，会遇到很不容易debug的error；
+- lambda表达式会产生仿函数；
+
+调用成员函数跟调用非静态成员函数有所不同，但幸运的是，17开始标准库引入了std::invoke()，其非常方便的统一了成员函数情况和常规函数情况。有这样的例子：
+
+```c++
+#include <utility>
+#include <functional>
+template<typename Iter, typename Callable, typename… Args>
+void foreach (Iter current, Iter end, Callable op, Args const&…args)
+{
+    while (current != end) { //as long as not reached the end of the
+        elements
+        std::invoke(op, //call passed callable with
+        args…, //any additional args
+        *current); // and the current element
+        ++current;
+    }
+}
+```
+
+invoke()会这样处理相关参数：
+
+- 如果可调用对象是一个指向成员函数的指针，它会将args...的第一个参数当作this对象，其余的参数则被当作常规参数传递给可调用对象；
+- 否则，所有的参数都被直接传递给可调用对象；
+
+注意这里可调用对象和args...都不能使用完美转发，因为第一次调用可能会steal相关参数的值，导致在随后的调用中出现错误。
+
+std::invoke()的一个常规用法是封装一个单独的函数调用（比如记录相关调用，测量所耗时长，或者准备一些上下文信息（比如为此启动一个线程））。此时可以通过完美转发可调用对象以及被传递参数来支持移动语义：
+
+```c++
+#include <utility> // for std::invoke()
+#include <functional> // for std::forward()
+template<typename Callable, typename… Args>
+decltype(auto) call(Callable&& op, Args&&… args)
+{
+    return std::invoke(std::forward<Callable>(op), //passed callable
+    with
+    std::forward<Args>(args)…); // any additional args
+}
+```
+
+注意这里的返回值，为了能够返回引用，需要使用decltype(auto)，其是14引入的，根据表达式决定了变量、返回值或者模板实参的类型。如果想要暂时将std::invoke的返回值存储在变量里，并在做了一些事情后返回，也必须将其声明为decltype(auto)类型：
+
+```c++
+decltype(auto) ret{std::invoke(std::forward<Callable>(op),
+	std::forward<Args>(args)…)}; …
+return ret
+```
+
+这里将ret声明为auto&&是不对的，其生命周期不会超出return。注意，如果可调用对象的返回值是void，将ret初始化为decltype(auto)也是不可以的，因为void是不完整类型，此时有如下的选择：
+
+- 在当前行前面声明一个对象，并在其析构函数中实现期望的行为，比如：
+
+  ```c++
+  struct cleanup {
+      ~cleanup() { … //code to perform on return
+      }
+  } dummy;
+  return std::invoke(std::forward<Callable>(op),
+  std::forward<Args>(args)…);
+  ```
+
+- 分别实现void和非void情况：
+
+  ```c++
+  #include <utility> // for std::invoke()
+  #include <functional> // for std::forward()
+  #include <type_traits> // for std::is_same<> and
+  invoke_result<>
+  template<typename Callable, typename… Args>
+  decltype(auto) call(Callable&& op, Args&&… args)
+  {
+      if constexpr(std::is_same_v<std::invoke_result_t<Callable,
+      Args…>, void>) {// return type is void:
+          std::invoke(std::forward<Callable>(op),
+          std::forward<Args>(args)…); …
+          return;
+      } else {
+          // return type is not void:
+          decltype(auto) ret{std::invoke(std::forward<Callable>(op),
+          std::forward<Args>(args)…)}; …
+          return ret;
+       }
+  }
+  
+  ```
+
+### 其他一些实现泛型库的工具
+
+比如：
+
+```c++
+#include <type_traits>
+template<typename T>
+class C
+{
+    // ensure that T is not void (ignoring const or volatile):
+    static_assert(!std::is_same_v<std::remove_cv_t<T>,void>,
+    "invalid instantiation of class C for void type");
+public:
+    template<typename V>
+    void f(V&& v) {
+    //if constexpr(std::is_reference_v<T>) { … // special code if T is a 			reference type
+    }
+    if constexpr(std::is_convertible_v<std::decay_t<V>,T>) { … // special code 		//if V is convertible to T
+    }
+    if constexpr(std::has_virtual_destructor_v<V>) { … // special code if V has 	//virtual destructor
+    }
+    }
+};
+```
+
+这里用到了编译期的if特性，该特性从17开始启用，作为替代选项，这里也可以使用std::enable_if、部分特例化或者SFINAE。使用类型萃取要格外小心，比如：
+
+```c++
+std::remove_const_t<int const&>
+```
+
+这里由于引用不是const类型，所以不会有任何效果，所以删除引用跟删除const的顺序就很重要：
+
+```c++
+std::remove_const_t<std::remove_reference_t<int const&>> // int
+std::remove_reference_t<std::remove_const_t<int const&>> // int const
+```
+
+另一种方法是直接调用：
+
+```c++
+std::decay_t<int const&>
+```
+
+函数模板std::addressof<>()会返回一个对象或者函数的准确地址，即使一个对象重载了运算符&也是如此。
+
+std::declval()可以被用作某一类型的对象的引用的占位符，该函数模板没有定义，因此不能被调用（也不会创建对象），因此其只能被用作不会被计算的操作数，比如：
+
+```c++
+#include <utility>
+template<typename T1, typename T2,
+typename RT = std::decay_t<decltype(true ? std::declval<T1>() :
+std::declval<T2>())>>
+RT max (T1 a, T2 b)
+{
+	return b < a ? a : b;
+}
+```
+
+为了避免在调用运算符?:的时候不得不调用T1和T2的默认构造函数，这里使用了std::declval，不要忘了使用decay来确保返回类型不会是一个引用，因为std::declval本身返回的是右值引用。
+
+### 完美转发临时变量
+
+某些情况下我们需要转发不是通过参数传递过来的数据，此时可以使用auto&&来创建一个可以被转发的变量，如：
+
+```c++
+template<typename T>
+void foo(T x)
+{
+    auto&& val = get(x); …
+    // perfectly forward the return value of get() to set():
+    set(std::forward<decltype(val)>(val));
+}
+```
+
+这样可以避免对中间变量的多余拷贝。
+
+### 作为模板参数的引用
+
+虽然可以通过显式引用来将模板参数变成引用，但有可能会带来问题，比如：
+
+```c++
+template<typename T, T Z = T{}>
+class RefMem {
+private:
+ 	T zero;
+public:
+    RefMem(): zero{Z} {}
+};
+int main()
+{
+    RefMem<int> rm1, rm2;
+    rm1 = rm2; // OK
+    RefMem<int&> rm3; // ERROR: invalid default value for N
+    RefMem<int&, 0> rm4; // ERROR: invalid default value for N extern
+    int null;
+    RefMem<int&,null> rm5, rm6;
+    rm5 = rm6; // ERROR: operator= is deleted due to reference member
+}
+```
+
+如果尝试用引用对其实例化，情况变的复杂：
+
+- 非模板参数的默认初始化不在可行；
+- 不再能够直接用0来初始化非参数模板参数；
+- 赋值运算符也不再可用，因为对于具有非静态引用成员的类，其默认赋值运算符会被删除；
+
+为了禁止用引用类型进行实例化，一个简单的static_assert就够了：
+
+```c++
+template<typename T>
+class optional
+{
+    static_assert(!std::is_reference<T>::value, "Invalid
+    instantiation of optional<T> for references"); …
+};
+```
+
+### 推迟计算
+
+比如这样的一个例子：
+
+```c++
+template<typename T>
+class Cont {
+private:
+    T* elems;
+public: …
+    typename
+    std::conditional<std::is_move_constructible<T>::value, T&&,
+    	T& >::type foo();
+};
+```
+
+通过使用std::conditional来决定foo的返回类型是T&&还是T&，决策标准是看T是否支持移动语义，问题在于std::is_move_constructible要求其参数必须是完整类型，为了解决这一问题，需要使用一个成员模板代替现有foo的定义，这样将std::is_move_constructible的计算推迟到foo的实例化阶段：
+
+```c++
+template<typename T>
+class Cont {
+private:
+    T* elems;
+public:
+    template<typename D = T>
+    typename
+    std::conditional<std::is_move_constructible<D>::value, T&&,
+    	T&>::type foo();
+};
+```
+
+实质是利用了模板只有被调用才会被实例化和两阶段编译检查的特性。
+
+## 深入模板基础
+
