@@ -2522,3 +2522,3244 @@ public:
 
 ## 深入模板基础
 
+### 参数化声明
+
+C++目前支持四种基础模板：类模板、函数模板、变量模板以及别名模板。这四种模板也可以出现在类中，变量模板在类作用域中将作为一个静态数据成员模板：
+
+```c++
+class Collection {
+  public:
+  	template<typename T> 	// an in-class member class template definition
+	class Node {
+	  ...
+	};
+	
+	template<typename T>	// an in-class (and therefore implicitly inline)
+	T* alloc() {			// member function template definition
+	  ...
+	}
+	
+	template<typename T>	// a member variable template (since c++14)
+	static T zero = 0;
+	
+	template<typename T>	// a member alias template
+	using NodePtr = Node<T>*;
+};
+```
+
+注意在c++17中，变量（包括静态数据成员）以及变量模板都是可以内联的，这意味着它们的定义可以跨越多个编译单元重复。以下代码展示了如何在类外定义别名模板以外的模板：
+
+```c++
+template<typename T>	// a namespace scope class template
+class List {
+  public:
+    List() = default;	// because a template constructor is defined
+	
+	template<typename U>	// another member class template,
+	class Handle;			// without its defination
+	
+	template<typename U>	// a member function template
+	List (List<U> const&);	// (constructor)
+	
+	template<typename U>	// a member variable template (since C++14)
+	static U zero;
+};
+
+template<typename T>	// out-of-class member class template definition
+template<typename U>
+class List<T>::Handle {
+  ...
+};
+
+template<typename T>	// out-of-class member function template definition
+template<typename T2>
+List<T>::List(List<T2> const& b)
+{
+  ...
+}
+
+template<typename T>	// out-of-class static data member template definition
+template<typename U>
+U List<T>::zero = 0;
+```
+
+定义在类外的成员模板需要多个template<...>参数化子句：每个外围作用域的类模板一个，成员模板本身也需要一个。另外注意到构造器模板会禁用掉隐式声明的默认构造器，因此增加了一个默认的构造函数。
+
+联合体模板也是可以的（其被视为一种类模板）：
+
+```c++
+template<typename T>
+union AllocChunk {
+	T object;
+	unsigned char bytes[sizeof(T)];
+};
+```
+
+函数模板可以有默认参数：
+
+```c++
+template<typename T>
+void report_top(Stack<T> const&, int number = 10);
+template<typename T>
+void fill(Array<T>&, T const& = T{}); // T{} is zero for built-in types
+```
+
+17之后，静态成员可以在类模板内部使用inline关键字初始化：
+
+```c++
+template<int I>
+class CupBoard {
+	...
+	inline static double totalWeight = 0.0;
+};
+```
+
+成员函数模板不能被声明为virtual，这是因为虚函数机制依赖一个固定大小的虚表，其中存储了每一个虚函数条目，但成员函数模板直到整个程序被编译之前，实例化的个数都无法确定。与之相反，类模板的普通成员函数可以是virtual。
+
+每个模板必须有一个名字，并且该名字必须是所属作用域内独一无二的，除了函数模板重载的场景。特别注意，与类类型不同，类模板无法与不同类型的实体共享名称：
+
+```c++
+int C;
+...
+class C;	// OK: class names and nonclass names are in a different "space"
+
+int X;
+...
+template<typename T>
+class X;	// ERROR: conflict with variable X
+
+struct S;
+...
+template<typename T>
+class S;	// ERROR: conflict with struct S
+```
+
+模板名称具有链接，但其无法拥有C链接：
+
+```c++
+extern "C++" template<typename T>
+void normal();		// this is the default: the linkage specification could be left out
+
+extern "C" template<typename T>
+void invalid();		// ERROR: templates cannot have C linkage
+
+extern "Java" template<typename T>
+void javaLink();	// nonstandard, but maybe some compiler will someday 
+					// support linkage compatible with Java generics
+```
+
+模板通常有外部链接，唯一的一些例外是命名空间作用域中具有静态限定符的函数模板、匿名空间的直接或间接的成员的模板（它们拥有内部链接）以及匿名类的成员模板（它们没有链接）：
+
+```c++
+template<typename T> 	// refers to the same entity as a declaration of the 
+void external();		// same name (and scope) in another file
+
+template<typename T>	// unrelated to a template with the same name in
+static void internal();	// another file
+
+template<typename T>	// redeclaration of the previous declaration
+static void internal();
+
+namespace {
+  template<typename>	// also unrelated to a template with the same name
+  void otherInternal();	// in another file, even one that similarly appears
+}						// in an unnamed namespace
+
+namespace {
+  template<typename>	// redeclaration of the previous template declaration
+  void otherInternal();
+}
+
+struct {
+  template<typename T> void f(T) {} // no linkage: cannot be redeclared
+} x;
+```
+
+当前，模板无法在函数作用域或局部类作用域中声明，但泛化的lambda可以。
+
+### 模板参数
+
+有三种基本类型的模板参数：类型参数、非类型模板参数、模板模板参数。
+
+在模板声明内，类型参数的行为与类型别名非常相似，例如，当T是模板参数时，则类内不能有class T之类的名称。
+
+非类型模板参数表示一个可以在编译期或链接期确定的常量值，这样的参数类型必须是以下之一：
+
+- 整形或枚举型
+- 指针类型
+- 成员指针类型
+- 左值引用类型（既可以是对象引用，也可以是函数引用）
+- `std::nullptr_t`
+- 包含`auto`或`decltype(auto)`的类型（17之后支持）
+
+在某些情况下，非类型模板参数的声明也可以用关键字typename开头：
+
+```c++
+template<typename T, 			// a type parameter
+		typename T::Allocator* Allocator>	// a nontype parameter
+class List;
+
+template<class X*>		// a nontype parameter of pointer type
+class Y;
+```
+
+函数和数组类型可以被指定，但它们会退化隐式的调整为相应的指针类型：
+
+```c++
+template<int buf[5]> class Lexer;		// buf is really an int*
+template<int* buf> class Lexer;			// OK: this is a redeclaration
+
+template<int fun()> struct FuncWrap;	// fun really has pointer to
+										// function type
+template<int (*)()> struct FuncWrap;	// OK: this is a redeclaration
+```
+
+非类型模板参数的声明与变量声明相似，但它们不可以有非类型指示符，比如static、mutable等，它们可以有const和volatile限定符，但这种限定符出现在参数类型的最顶层就会被忽略（即对左值引用或指针来说支持底层const）：
+
+```c++
+template<int const length> class Buffer;	// const is useless here
+template<int length> class Buffer;			// same as previous declaration
+```
+
+最后，在表达式使用时，非引用类型的非类型参数始终都是prvalues（pure right value，即纯右值），它们的地址无法被窃取也无法被赋值，另一方面左值引用类型的非类型参数可以像左值一样使用，右值引用是不允许的。
+
+模板模板参数是类或别名模板的占位符，其声明与类模板很像，但不能使用关键字struct或union：
+
+```c++
+template<template<typename X> class C>		// OK
+void f(C<int>* p);
+
+template<template<typename X> struct C>		// ERROR: struct not valid here
+void f(C<int>* p);
+
+template<template<typename X> union C>		// ERROR: union not valid here
+void f(C<int>* p);
+```
+
+C++17允许用typename替代class，因此，模板模板参数不仅可以由类模板替代，而且可以由别名模板替代：
+
+```c++
+template<template<typename X> typename C>		// OK since C++17
+void f(C<int>* p);
+```
+
+模板模板参数的参数可以有默认模板参数。
+
+从11开始，可以通过在模板参数名称之前引入省略号来将任何类型的模板参数转换为模板参数包（如果模板参数匿名，那么就在模板参数名称本该出现的位置之前）：
+
+```c++
+template<typename... Types>		// declares a template parameter pack named Types
+class Tuple;
+```
+
+主模板中的类模板、变量模板和别名模板至多只可以有一个模板参数包，且模板参数包必须作为最后一个模板参数。函数模板则少了一些限制：允许多个模板参数包，只有模板参数包后面的每个模板参数都具有默认值或可以推导，比如：
+
+```c++
+template<typename... Types, typename Last>
+class LastType;		// ERROR: template parameter pack is not the last template parameter
+
+template<typename... TestTypes, typename T>
+void runTests(T value);		// OK: template parameter pack is followed
+							// by a deducible template parameter
+template<unsigned...> struct Tensor;
+template<unsigned... Dims1, unsigned... Dims2>
+auto compose(Tensor<Dims1...>, Tensor<Dims2...>);	// OK: the tensor dimensions can be deduced
+```
+
+类和模板的偏特化声明可以有多个参数包，这与主模板不同，因为偏特化是通过与函数模板几乎相同的推导过程选择的：
+
+```c++
+template<typename...> Typelist;
+template<typename X, typename Y> struct Zip;
+template<typename... Xs, typename... Ys>
+struct Zip<Typelist<Xs...>, Typelist<Ys...>>;
+			// OK: partial specialization uses deduction to determine
+			// the Xs and Ys substitutions
+```
+
+当然，类型参数包不能在自己的参数子句中进行扩展：
+
+```c++
+template<typename... Ts, Ts... vals> struct StaticValues {};
+	// ERROR: Ts cannot be expanded in its own parameter  list
+```
+
+但嵌套模板可以创建类似的场景：
+
+```c++
+template<typename... Ts> struct ArgList {
+  template<Ts... vals> struct Vals {};
+};
+ArgList<int, char, char>::Vals<3, 'x', 'y'> tada;
+```
+
+非模板参数包的任何类别的模板参数都可以配置默认参数，默认实参不能依赖自身的参数，因为参数的名称直到默认实参之后才在作用域生效，但其可以依赖前面的参数：
+
+```c++
+template<typename T, typename Allocator = allocator<T>>
+class List;
+```
+
+只有在后续参数提供了默认参数时，类模板、变量模板或别名模板的模板参数才可以具有默认模板实参：
+
+```c++
+template<typename T1, typename T2, typename T3,
+		 typename T4 = char, typename T5 = char>
+class Quintuple;	// OK
+
+template<typename T1, typename T2, typename T3 = char,
+		 typename T4, typename T5>
+class Quintuple;	// OK: T4 and T5 already have defaults
+
+template<typename T1 = char, typename T2, typename T3, 
+		 typename T4, typename T5>
+class Quintuple;	// ERROR: T1 cannot have a default argument
+					// because T2 doesn't have a default
+```
+
+不过函数模板的模板参数的默认模板实参不需要后续的模板参数必须有一个默认模板实参，比如：
+
+```c++
+template<typename R = void, typename T>
+R* addressof(T& value);	// OK: if not explicitly specified, R will be void
+```
+
+默认模板实参不允许重复声明：
+
+```c++
+template<typename T = void>
+class Value;
+
+template<typename T = void>
+class Value;	// ERROR: repeated default argument
+```
+
+许多上下文不允许使用默认模板实参：
+
+- 偏特化：
+
+  ```c++
+  template<typename T>
+  class C;
+  ...
+  template<typename T = int>
+  class C<T*>;	// ERROR
+  ```
+
+- 参数包：
+
+  ```c++
+  template<typename... Ts = int> struct X;	// ERROR
+  ```
+
+  
+
+- 类模板成员类外定义：
+
+  ```c++
+  template<typename T> 
+  struct x
+  {
+  	T f();
+  };
+  
+  template<typename T = int> // ERROR
+  T X<T>::f() {		
+    ...
+  }
+  ```
+
+  
+
+- 友元类模板声明：
+
+  ```c++
+  struct S {
+    template<typename = void> friend struct F;
+  };
+  ```
+
+  
+
+- 友元函数模板声明，除非它是一个定义并且它在编译单元的其他任何地方都没有声明：
+
+  ```c++
+  struct S{
+    template<typename = void> friend void f();	// ERROR: not a definition
+    template<typename = void> friend void g() {	// OK so far
+    }
+  };
+  
+  template<typename> void g();	// ERROR: g() was given a default template argument
+  								// when defined; no other declaration may exist here
+  ```
+
+### 模板实参
+
+模板实参可以被各种不同类型的机制所判定：
+
+- 显式模板实参：模板名称后面跟随在尖括号内显式指定的模板实参，这种叫做模板ID；
+- 注入式类名：在类模板的作用域内，模板X的名称等价于模板ID，`X<P1, P2, ...>`；
+- 默认模板实参：注意对于类模板或别名模板来说，即使模板参数有默认值，尖括号也不能省略；
+- 实参推导：没有被显式指定的函数模板参数会通过函数调用的实参类型进行推导；
+
+非类型实参是指那些替换非类型模板参数的值，这些值必须是以下几种：
+
+- 另一个具有正确类型的非类型模板参数；
+- 整型（或枚举）类型的编译器常量；
+- 外部变量或函数的名称，其前面带有内置的一元&运算符，对于函数和数组变量，可以省略&。此类模板实参与指针类型的非类型参数匹配，17放宽了要求，允许任何的常量表达式产生一个指向函数或变量的指针；
+- 对于引用类型的非类型参数，前一种（但不带&）实参是有效实参，同样17也放宽了约束，允许任意的常量表达式应用于函数或变量；
+- 成员指针常量，即类似&C::m；
+- 空指针常量对指针或成员函数指针的非类型参数都是合法的；
+
+17以前，将实参与作为指针或引用的参数进行匹配时，不会考虑用户定义的转换和派生类到基类的转换。以下是一些例子：
+
+```c++
+template<typename T, T nontypeParam>
+class C;
+
+C<int, 33>* c1;		// integer type
+int a;
+C<int*, &a>* c2;	// address of an external variable
+
+void f();
+void f(int);
+C<void (*)(int), f>* c3;	// name of a function: overload resolution selects
+							// f(int) in this case; the & is implied
+							
+template<typename T> void templ_func();
+C<void(), &templ_func<double>>* c4;	// function template instantiations are functions
+struct X {
+  static bool b;
+  int n;
+  constexpr operator int() const { return 42; }
+};
+
+C<bool&, X::b>* c5;	// static class members are acceptable variable/function names
+
+C<int X::*, &X::n>* c6;	// an example of a pointer-to-member constant
+
+C<long, X{}>* c7;		// OK: X is the first converted to int via a constexpr conversion
+						// function and then to long via a standard integer conversion
+```
+
+模板实参的一个限制就是编译器或链接器必须在程序构建时有能力表示它们的值，运行前无法知晓的值（像局部变量的地址）就不行，尽管如此，有一些常量竟然是无效的：
+
+- 浮点数；
+- 字符串字面量（11之前空指针常量也不行）
+
+字符串字面值的一个问题在于相同的字面量可以存在不同的地址，可以采取一种迂回的方法来解决这个问题，这涉及到引入了一个附加变量来保存字符串：
+
+```c++
+template<char const *str>
+class Message {
+  ...
+};
+
+extern char const hello[] = "Hello Wolrd!";
+char const hello11[] = "Hello World!";
+
+void foo()
+{
+  static char const hello17[] = "Hello World!";
+  
+  Message<hello> msg03;		// OK in all versions
+  Message<hello11> msg11;	// OK since C++11
+  Message<hello17> msg17;	// OK since C++17
+}
+```
+
+从上面可以看出，声明为引用或指针的非类型模板参数必须是一个在C++版本中拥有外部链接的常量表达式，从11开始内部链接也可，17则是只要有任意某个链接即可。
+
+这里也有一些不合法的例子：
+
+```c++
+template<typename T, T nontypeParam>
+class C;
+
+struct Base {
+  int i;
+} base;
+
+struct Derived : public Base {
+} derived;
+
+C<Base*, &derived>* err1;		// ERROR: derived-to-base conversions are not considered
+
+C<int&, base.i>* err2;			// ERROR: fields of variables aren't considered to be variables
+
+int a[10];
+C<int*, &a[0]>* err3;			// ERROR: addresses of array elements aren't acceptable either
+```
+
+在17之前，模板模板实参的默认实参会被忽略，即模板不认为这是默认值。17之后放宽了这一规则，只需要模板模板参数至少被相应的模板模板实参特化，在17之前，以下代码非法：
+
+```c++
+#include <list>
+	// declares in namespace std:
+	// template<typename T, typename Allocator=allocator<T>>
+	// class list;
+template<typename T1, typename T2, template<typename> class Cont> // Cont expects one parameter
+class Rel {
+  ...
+};
+
+Rel<int, double, std::list> rel;	// ERROR before C++17: std::list has more than 
+									// one template parameter
+```
+
+原因在于std::list拥有多于一个的模板参数，第二个参数拥有默认值，在17之前这将被忽略。相比较之下，可变参数模板是个例外：
+
+```c++
+#include <list>
+
+template<typename T1, typename T2, 
+		 template<typename... > class Cont>		// Cont expects any number of 
+class Rel {										// type parameters
+  ...
+};
+
+Rel<int, double, std::list> rel;				// OK: std::list has two template parameters
+												// but can be used with one argument
+```
+
+当两组模板实参的每一对参数值相同时，其被视为等效的，如下：
+
+```c++
+template<typename T, int I>
+class Mix;
+
+using Int = int;
+
+Mix<int, 3*3>* p1;
+Mix<int, 4+5>* p2;	// p2 has the same type as p1
+```
+
+成员函数模板生成的函数永远不会覆盖(override)虚函数。
+
+构造器模板生成的构造器永远不会是拷贝或移动构造器。类似的，赋值操作符模板生成的赋值操作符函数也永远不会是拷贝赋值或是移动赋值操作符函数。（然而，由于隐式调用拷贝赋值或移动赋值操作符函数的情景相对少，所以这一般不会引起问题。）
+
+### 可变模板
+
+sizeof...表达式是包展开的一个例子，以下也是：
+
+```c++
+template<typename ...Types>
+class MyTuple : public Tuple<Types..> {
+	// extra operations provided only for MyTuple
+};
+
+MyTuple<int, float> t2;	// inherits from Tuple<int, float>
+```
+
+每个包展开都有一个模式，是一个被实参包的每个实参所替代的类型或表达式，比如：
+
+```c++
+template<typename... Types>
+class PtrTuple : public Tuple<Types*...> {
+  // extra operations provided only for PtrTuple
+};
+
+PtrTuple<int, float> t3;	// Inherits from Tuple<int*, float*>
+```
+
+包展开基本可以在语法提供逗号分隔列表的任何位置使用，比如：
+
+- 基类列表；
+- 构造器中的基类初始化列表；
+- 调用实参列表；
+- 初始化列表；
+- lei、函数或别名模板的模板参数列表；
+- 函数可以抛出的一场列表（11开始不建议使用，17之后不再允许）；
+- 在属性内；
+- 指定某个声明的对其方式时；
+- 指定lambda表达式捕获列表时；
+- 函数类型的参数列表；
+- 在using声明中（17开始支持）；
+
+示例如下：
+
+```c++
+template<typename... Mixins>
+class Point : public Mixins... {	// base class pack expansion
+    double x, y, z;
+  public:
+    Point() : Mixins()... { }		// base class initializer pack expansion
+	template<typename Visitor>
+	void visitMixins(Visitor visitor) {
+	  visitor(static_cast<Mixins&>(*this)...);	// call argument pack expansion
+	}
+};
+
+struct Color { char red, green, blue; };
+struct Label { std::string name; };
+Point<Color, Label> p;		// inherits from both Color and Label
+```
+
+包展开也在模板参数列表中创建非类型模板参数包时使用：
+
+```c++
+template<typename... Ts>
+struct Values {
+  template<Ts... Vs>
+  struct Holder {
+  };
+};
+
+int i;
+Values<char, int, int*>::Holder<'a', 17, &i> valueHolder;
+```
+
+17引入的折叠表达式可以应用于除了.、->和[]以外的所有二元操作符。给定一个未展开表达式模式pack和一个非模式表达式value，17允许使用任意操作符op写出：
+
+```c++
+(pack op ... op value) //作为操作符右折叠
+(value op ... op pack) //作为操作符左折叠
+```
+
+17还支持一元右折叠和一元左折叠，但要注意空展开，除了以下三种特例：
+
+- 单一折叠`&&`对空展开产生一个值`true`。
+- 单一折叠`||`对空展开产生一个值`false`。
+- 单一折叠`,`会产生表达式`void`。
+
+### 友元
+
+友元有以下特点：
+
+1. 友元的声明必须唯一；
+2. 友元函数声明时可以直接定义；
+
+友元类特别的一点是能够将类模板的特定实例声明为友元：
+
+```c++
+template<typename T>
+class Node;
+
+template<typename T>
+class Tree {
+  friend class Node<T>;
+  ...
+};
+```
+
+注意，类模板必须在其实例之一成为类或类模板的友元时是可见的（即有完整的定义），对普通类来说，无此要求：
+
+```c++
+template<typename T>
+class Tree {
+  friend class Factory;	// OK even if first declaration of Factory
+  friend class Node<T>;	// error if Node isn't visible
+};
+```
+
+11也增加了让模板参数作友元的语法：
+
+```c++
+template<typename T>
+class Wrap {
+  friend T;
+  ...
+};
+```
+
+如果T不是一个类类型，友元会被忽略。
+
+函数模板的实例可以作为友元，只要友元函数名称后跟一个尖括号子句即可。
+
+如果名称后没有跟尖括号子句，那么有两种可能：
+
+1. 如果名字没有限定符（换句话说，不包含`::`），它永远不会是一个模板实例。如果友元声明时不存在可见的匹配的非模板函数，此处的友元声明就作为该函数的第一次声明。该声明也可以是一个定义。
+2. 如果名称带有限定符（包含`::`），该名称必须可以引用到一个此前声明过的函数或函数模板。非模板函数会比函数模板优先匹配。然而，这里的友元声明不能是一个定义。这里有个例子来说明这一区别：
+
+```c++
+void multiply(void*);	// ordinary function
+
+template<typename T>
+void multiply(T);		// function template
+
+class Comrades {
+  friend void multiply(int) { }	// defines a new function ::multiply(int)
+  
+  friend void ::multiply(void*); //refers to the ordinary function above,
+  								// not the the multiply<void*> instance
+  friend void ::multiply(int);	// refers to an instance of the template
+  friend void ::multiply<double*>(double*);	// qualified names can also have angle brackets,
+  											// but a template must be visible
+  friend void ::error() { }	// ERROR: a qualified friend cannot be a definition
+};
+```
+
+函数模板也可以在类模板中定义，此时只有在它真正被使用到时才会实例化。通常，这要求友元函数以友元函数的类型使用类模板本身，这使得在类模板上表示函数变得更容易，就好像它们在命名空间中可见一样：
+
+```c++
+template<typename T>
+class Creator {
+  friend void feed(Creator<T>) { //every T instantiates a different function ::feed()
+    ...
+  }
+};
+
+int main()
+{
+  Creator<void> one;
+  feed(one);		// instantiates ::feed(Creator<void>)
+  Creator<double> two;
+  feed(two);		// instantiates ::feed(Creator<double>)
+}
+```
+
+友元模板如下：
+
+```c++
+class Manager {
+  template<typename T>
+  friend class Task;
+  
+  template<typename T>
+  friend void Schedule<T>::dispatch(Task<T>*);
+  
+  template<typename T>
+  friend int ticket() {
+    return ++Manager::counter;
+  }
+  
+  static int counter;
+};
+```
+
+与普通的友元声明一样，当名称是不含限定符的函数名时友元模板也可以是一个定义，函数名后不接尖括号子句。友元模板只能定义主模板和主模板的成员。主模板的偏特化和显式特化都会被自动视为友元。
+
+## 模板中的名称
+
+### 名称的分类
+
+有以下两种名称的概念：
+
+1. 如果名称作用域由操作符::或成员访问操作符.或->显式指定，则称该名称为受限名称；
+2. 如果一个名称以某种方式依赖于模板参数，那么该名称就是一个依赖型名称；
+
+### 名称查找
+
+参数依赖查找（ADL）产生的动机：
+
+```c++
+template<typename T>
+T max(T a, T b)
+{
+  return b < a ? a : b;
+}
+namespace BigMath {
+  class BigNumber {
+    ...
+  };
+  
+  bool operator < (BigNumber const &, BigNumber const &);
+  ...
+}
+
+using BigMath::BigNumber;
+
+void g(BigNumber const& a, BigNumber const& b)
+{
+  ...
+  BigNumber x = ::max(a,b);
+  ...
+}
+```
+
+由于max模板不认识BigMath命名空间，普通的查找无法找到BigNumber适用的operator<。ADL主要应用于非限定名称，如果普通查找找到了以下内容，那么ADL不会发生：
+
+- 成员函数名称；
+- 变量名称；
+- 类型名称；
+- 块作用域函数声明名称；
+
+如果把被调用函数名称用圆括号括起来，ADL也会被禁用。否则，如果名称后的括号里面有实参表达式列表，则ADL会查找这些实参关联的命名空间和类，例如某一类型是一个class X的指针，那么关联的类和命名空间就包括X和X所属的任何命名空间和类。唯一例外是ADL会忽略using指示符。
+
+```c++
+#include <iostream>
+
+namespace X {
+  template<typename T> void f(T);
+}
+
+namespace N {
+  using namespace X;
+  enum E { e1 };
+  void f(E) {
+    std::cout << "N::f(N::E) called\n";
+  }
+}
+
+void f(int)
+{
+  std::cout << "::f(int) called\n";
+}
+
+int main()
+{
+  ::f(N::e1);	// qualified function name: no ADL
+  f(N::e1);		// ordinary lookup finds ::f() and ADL finds N::f(),
+  				// the latter is preferred
+}
+```
+
+### 解析模板
+
+一个模板无法引用另一个模板的名称，因为其他模板的内容可能因特化而使得原来的名称失效，例如以下的例子：
+
+```c++
+template<typename T>
+class Trap {
+  public:
+    enum { x };	// #1 x is not a type here
+};
+
+template<typename T>
+class Victim {
+  public:
+    int y;
+	void poof() {
+	  Trap<T>::x * y;	// #2 declaration or multiplication?
+	}
+};
+
+template<>
+class Trap<void> {	// evil specialization!
+  public:
+    using x = int;	// #3 x is a type here
+};
+
+boid boom(Victim<void>& bomb)
+{
+  bomb.poof();
+}
+```
+
+C++这样来解决这个问题，一个依赖型受限名称并不代表一个类型，除非在名字前面加上typename前缀。当类型名称具有以下性质，就应该添加typename前缀：
+
+1. 名称受限，且本身没有跟::组成更加受限的名称；
+2. 名称不是详细类型说明符的一部分（例如class、struct、union或enum起始关键字）；
+3. 名称不在指定基类继承的列表中，也不在引入构造函数的成员初始化列表中；
+4. 名称依赖于模板参数；
+5. 名称是某个未知的特化的成员，这意味着由限定器命名的类型指代一个未知的特化；
+
+示例如下：
+
+```c++
+template<typename T>				// 1
+struct S : typename X<T>::Base {	// 2
+  S() : typename X<T>::Base(typename X<T>::Base(0)) {	// 3 4
+  }
+  
+  typename X<T> f() {				// 5
+    typename X<T>::C * p;			// declaration of pointer p	// 6
+	X<T>::D *q;
+  }
+  
+  typename X<int>::C *s;			// 7
+  
+  using Type = T;
+  using OtherType = typename S<T>::Type;	// 8
+}
+```
+
+每个出现的`typename`，不管正确与否，都被标了号。第一个`typename`表示一个模板参数。前面的规则没有应用于此。第二个和第三个`typename`由于上述规则的第三条而被禁止。这两个上下文中，基类的名称不能用`typename`引导。然而，第四个`typename`是必不可少的，因为这里基类的名称既不是位于初始化列表，也不是位于派生类的继承列表，而是为了基于实参`0`构造一个临时`X<T>::Base`表达式（也可以是某种强制类型转换）。第5个`typename`同样不合法，因为它后面的名称`X<T>`并不是一个受限名称。对于第6个`typename`，如果期望声明一个指针，那么这个`typename`是必不可少的。下一行省略了关键字`typename`，因此也就被编译器解释为一个乘法表达式。第7个`typename`是可选（可有可无）的，因为它符合前面的两条规则，但不符合后面的两条规则。第8个`typename`也是可选的，因为它指代的是一个当前实例的成员（也就不满足最后一条规则）。
+
+最后一条判断`typename`前缀是否需要的规则有时候难以评估，因为它取决于判断类型所指代的是一个当前实例还是一个未知的特化这一事实。在这种场景中，最简单安全的方法就是直接添加`typename`关键字来指示受限名称是一个类型。`typename`关键字，尽管它是可选的，也会提供一个意图上的说明。
+
+依赖型模板名称的示例：
+
+```c++
+template<typename T>
+class Shell {
+  public:
+    template<int N>
+	class In {
+	  public:
+	    template<int M>
+		class Deep {
+		  public:
+		    virtual void f();
+		};
+	};
+};
+
+template<typename T, int N>
+class Weird {
+  public:
+    void case1 (typename Shell<T>::template In<N>::template Deep<N>* p) {
+	  p->template Deep<N>::f();		// inhibit virtual call
+	}
+	void case2 (typename Shell<T>::template In<N>::template Deep<N>& p) {
+	  p.template Deep<N>::f();		// inhibit virtual call
+	}
+};
+```
+
+限定符前面的名称或表达式的类型需要依赖某个模板参数，并且紧跟限定符后面的是一个模板id，那么就应该使用关键字template。
+
+Using声明会从命名空间和类引入名称，有以下的例子：
+
+```c++
+class BX {
+  public:
+    void f(int);
+	void f(char const*);
+	void g();
+};
+
+class DX : private BX {
+  public:
+    using BX::f;
+};
+```
+
+从以上的例子中可以看出，using声明可以让以前不能访问的成员变成可访问的。但可能也会有问题，引入名称之后我们不知道这个名称是一个类型还是一个模板，或是别的东西：
+
+```c++
+template<typename T>
+class BXT {
+  public:
+    using Mystery = T;
+	template<typename U>
+	struct Magic;
+};
+
+template<typename T>
+class DXTT : private BXT<T> {
+  public:
+    using typename BXT<T>::Mystery;
+	Mystery* p;		// would be a syntax error without the earlier typename
+};
+```
+
+当想要使用using声明引入依赖型名称来指定类型时，必须显式的插入typename关键字前缀，但当这个名称是模板时，则没有这样的标准：
+
+```c++
+template<typename T>
+class DXTM : private BXT<T> {
+  public:
+    using BXT<T>::template Magic;	// ERROR: not standard
+	Magic<T>* plink;				// SYNTAX ERROR: Magic is not a known template
+};
+```
+
+但可以迂回的采用如下的方案：
+
+```c++
+template<typename T>
+class DXTM : private BXT<T> {
+  public:
+    template<typename U>
+	  using Magic = typename BXT<T>::template Magic<T>;	// Alias template
+	  Magic<T>* plink;									// OK
+};
+```
+
+考虑这样的例子：
+
+```c++
+namespace N {
+  class X {
+    ...
+  };
+  
+  template<int I> void select(X*);
+}
+
+void g(N::X* xp)
+{
+  select<3>(xp);	// ERROR: no ADL!
+}
+```
+
+出错原因在于直到确定select是一个模板之前都无法确定\<3\>是一个模板实参列表，但可以在调用前引入select的函数模板声明来解决这个问题：
+
+```c++
+template<typename T> void select();
+```
+
+依赖表达式最常见的是类型依赖表达式，如下：
+
+```c++
+template<typename T> void typeDependent1(T x)
+{
+  x;	// the expression type-dependent, because the type of x can vary
+}
+```
+
+还有这样的例子：
+
+```c++
+template<typename T> void typeDependent2(T x)
+{
+  f(x);		// the expression is type-dependent, because x is type-dependent
+}
+```
+
+f(x)的类型可能因实例的变化而有所不同，因此两阶段查找可能在不同的实例中找到完全不同的函数名f。
+
+除此之外，还有值依赖表达式：
+
+```c++
+template<int N> void valueDependent1()
+{
+  N;	// the expression is value-dependent but not type-dependent;
+  		// because N has a fixed type but a varying constant type
+}
+```
+
+有趣的是，一些操作符，比如sizeof，拥有一个已知的结果类型，可以将一个类型依赖操作数转换成一个值依赖表达式，例如：
+
+```c++
+template<typename T> void valueDependent2(T x)
+{
+  sizeof(x);	// the expression is value-dependent but not type-dependent
+}
+```
+
+当所有的模板实例都会产生错误时，编译期允许在解析模板时诊断错误。
+
+### 派生和类模板
+
+非依赖型基类示例如下：
+
+```c++
+template<typename X>
+class Base {
+  public:
+    int basefield;
+	using T = int;
+};
+
+class D1 : public Base<Base<void>> {	// not a template case really
+  public:
+    void f() { basefield = 3; }			// usual access to inherited member
+};
+
+template<typename T>
+class D2 : public Base<double> {		// nondependent base
+  public:
+    void f() { basefield = 7; }			// usual access to inherited member
+	T strange;							// T is Base<double>::T, not the template parameter!
+};
+```
+
+注意，当非受限名称在模板继承中被找到时，非依赖型基类会优先考虑该名称之后才轮到模板参数列表。
+
+对于依赖型基类，考虑以下的问题：
+
+```c++
+template<typename T>
+class DD : public Base<T> {		// dependent base
+  public:
+    void f() { basefield = 0; }	// #1 problem
+};
+
+template<>	// explicit specialization
+class Base<bool>{
+  public:
+    enum { basefield = 42 };	// #2 tricky!
+};
+
+void g(DD<bool>& d)
+{
+  d.f();						// #3 oops?
+}
+```
+
+在1处将basefield与int类型进行了绑定了，那么2处的特例化会更改basefield的意义，当在3处使用时就会报错。为了解决这个问题，标准规定非依赖型名称不会在依赖型基类中进行查找，为了解决上述问题，可以将非依赖型名称改为依赖型，比如：
+
+```c++
+template<typename T>
+class DD1 : public Base<T> {
+  public:
+    void f() { this->basefield = 0; }	// lookup delayed
+};
+```
+
+还可以使用受限名称来引入依赖性：
+
+```c++
+template<typename T>
+class DD2 : public Base<T> {
+  public:
+    void f() { Base<T>::basefield = 0; }
+};
+```
+
+这种情况要格外小心，如果原来的非受限的非依赖型名称被用于虚函数调用的话，那么这种引入依赖性的限定会禁止虚函数调用。
+
+## 模板的多态性
+
+### 动态多态
+
+即通过继承虚函数并重写实现的多态
+
+### 静态多态
+
+模板也可以用来实现多态，但其不依赖于对基类中公共行为的重写，但其要求不同的类型必须使用相同的语法操作（相关函数的名称相同）。在定义上，具体的类之间相互独立。示例如下：
+
+```c++
+//动态多态
+void myDraw (GeoObj const& obj) // GeoObj is abstract base
+class
+{
+	obj.draw();
+}
+//静态多态
+template<typename GeoObj>
+void myDraw (GeoObj const& obj) // GeoObj is template
+parameter
+{
+	obj.draw();
+}
+```
+
+其主要区别在于将GeoObj作为模板参数而不是公共基类。完整的示例如下：
+
+```c++
+#include "coord.hpp"
+// concrete geometric object class Circle
+// - not derived from any class
+class Circle {
+public:
+    void draw() const;
+    Coord center_of_gravity() const；
+ …
+};
+// concrete geometric object class Line
+// - not derived from any class
+class Line {
+public:
+    void draw() const;
+    Coord center_of_gravity() const; …
+};
+…
+    
+#include "statichier.hpp"
+#include <vector>
+// draw any GeoObj
+template<typename GeoObj>
+void myDraw (GeoObj const& obj)
+{
+	obj.draw(); // call draw() according to type of object
+}
+// compute distance of center of gravity between two GeoObjs
+template<typename GeoObj1, typename GeoObj2>
+Coord distance (GeoObj1 const& x1, GeoObj2 const& x2)
+{
+    Coord c = x1.center_of_gravity() - x2.center_of_gravity();
+    return c.abs(); // return coordinates as absolute values
+}
+// draw homogeneous collection of GeoObjs
+template<typename GeoObj>
+void drawElems (std::vector<GeoObj> const& elems)
+{
+    for (unsigned i=0; i<elems.size(); ++i) {
+    elems[i].draw(); // call draw() according to type of element
+	}
+}
+int main()
+{
+    Line l;
+    Circle c, c1, c2;
+	myDraw(l); // myDraw<Line>(GeoObj&) => Line::draw()
+    myDraw(c); // myDraw<Circle>(GeoObj&) =>
+    Circle::draw()
+    distance(c1,c2); //distance<Circle,Circle>
+    (GeoObj1&,GeoObj2&)
+    distance(l,c); // distance<Line,Circle>(GeoObj1&,GeoObj2&)
+    // std::vector<GeoObj*> coll; //ERROR: no heterogeneous
+    collection possible
+    std::vector<Line> coll; // OK: homogeneous collection
+    possible
+    coll.push_back(l); // insert line
+    drawElems(coll); // draw all lines
+}
+```
+
+静态多态的限制：所有的类型必须在编译期可知。
+
+### 动态多态vs静态多态
+
+动态多态有以下优点：
+
+- 可以很优雅的处理异质集合；
+- 可执行文件的大小可能会比较小；
+- 代码可以被完整的编译，没有必须要公开的代码；
+
+静态多态的优点：
+
+- 内置类型的集合可以被很容易的实现；
+- 产生的代码可能会更快（不需要指针的重定向，先验的非虚也更容易被inline）；
+- 即使某个类型只提供了部分的接口也可以用于静态多态，只要不使用那些没有实现的接口；
+
+通常认为静态多态要比动态多态更类型安全，因为其所有的绑定都在编译期进行了检查。
+
+### 使用concepts
+
+其代表为了能够成功的实例化模板，模板参数必须要满足的一组约束条件。其示例如下：
+
+```c++
+#include "coord.hpp"
+template<typename T>
+concept GeoObj = requires(T x) {
+    { x.draw() } -> void;
+    { x.center_of_gravity() } -> Coord; …
+};
+```
+
+### 新形势下的设计模式
+
+比如桥接模式，转变如下图：
+
+![bridgePatten](..\image\template\bridgePatten.png)
+
+## 萃取的实现
+
+### 一个例子：对一个序列求和
+
+比如这个求和的例子：
+
+```c++
+#ifndef ACCUM_HPP
+#define ACCUM_HPP
+template<typename T>
+T accum (T const* beg, T const* end)
+{
+    T total{}; // assume this actually creates a zero value
+    while (beg != end) {
+        total += *beg;
+        ++beg;
+    }
+    return total;
+}
+#endif //ACCUM_HPP
+```
+
+如果对一些字符求和，由于字符的值基本上都是通过ASCII码决定的，这样很容易返回一个值超出char类型的范围，虽然可以通过增加一个返回值参数来解决，但这完全是可以避免的，可以在T和与之对应的返回值类型之间建立某种联系，可通过偏特化实现：
+
+```c++
+template<typename T>
+struct AccumulationTraits;
+template<>
+struct AccumulationTraits<char> {
+	using AccT = int;
+};
+template<>
+struct AccumulationTraits<short> {
+	using AccT = int;
+};
+template<>
+struct AccumulationTraits<int> {
+	using AccT = long;
+};
+template<>
+struct AccumulationTraits<unsigned int> {
+	using AccT = unsigned long;
+};
+template<>
+struct AccumulationTraits<float> {
+	using AccT = double;
+};
+
+#ifndef ACCUM_HPP
+#define ACCUM_HPP
+#include "accumtraits2.hpp"
+template<typename T>
+auto accum (T const* beg, T const* end)
+{
+// return type is traits of the element type
+    using AccT = typename AccumulationTraits<T>::AccT;
+    AccT total{}; // assume this actually creates a zero value
+    while (beg != end) {
+        total += *beg;
+        ++beg;
+    }
+    return total;
+}
+#endif //ACCUM
+```
+
+AccumulationTraits模板就被称为萃取模板，它提取了其参数类型的特性。
+
+萃取一般代表的都是特定主类型的额外的类型信息，但额外信息不局限于类型信息，还可以将常量以及其他数值类和一个类型关联起来。比如为前面求和的初始值添加一个值萃取（值特性？）：
+
+```c++
+template<typename T>
+struct AccumulationTraits;
+template<>
+struct AccumulationTraits<char> {
+    using AccT = int;
+    static AccT const zero = 0;
+};
+template<>
+struct AccumulationTraits<short> {
+    using AccT = int;
+    static AccT const zero = 0;
+};
+template<>
+struct AccumulationTraits<int> {
+    using AccT = long;
+    static AccT const zero = 0;
+};
+
+using AccT = typename AccumulationTraits<T>::AccT;
+AccT total = AccumulationTraits<T>::zero; // init total by trai
+```
+
+这一类型的不足之处在于，C++只允许我们在类中对一个整型或枚举类型的static const成员进行初始化。constexpr的static数据成员好一些，允许对float类型以及其他字面值进行类内初始化：
+
+```c++
+template<>
+struct AccumulationTraits<float> {
+    using Acct = float;
+    static constexpr float zero = 0.0f;
+};
+```
+
+但是无论是const还是constexpr都禁止对非字面值类型进行这一类的初始化，比如用户自定义的任意精度的BigInt类型，因为它可能将一部分信息存储在堆中，或者是因为我们需要的构造函数不是constexpr的：
+
+```c++
+class BigInt {
+	BigInt(long long); …
+};…
+template<>
+struct AccumulationTraits<BigInt> {
+    using AccT = BigInt;
+    static constexpr BigInt zero = BigInt{0}; // ERROR: not a literal type
+构造函数不是 constexpr 的
+};
+```
+
+一个比较直接的解决方案是，不在类中定义值萃取：
+
+```c++
+template<>
+struct AccumulationTraits<BigInt> {
+    using AccT = BigInt;
+    static BigInt const zero; // declaration only
+};
+```
+
+然后在源文件中初始化：
+
+```c++
+BigInt const AccumulationTraits<BigInt>::zero = BigInt{0}；
+```
+
+这样通常会有些低效，因为编译期通常不知道它在其他文件中的变量定义，17中可以使用inline变量解决这个问题：
+
+```c++
+template<>
+struct AccumulationTraits<BigInt> {
+    using AccT = BigInt;
+    inline static BigInt const zero = BigInt{0}; // OK since C++17
+}；
+```
+
+在17之前的一种解决方法是对那些不总是生成整型值的值萃取，使用inline成员函数，同样的，如果成员函数返回的是字面值类型，可以将该函数声明为constexpr：
+
+```c++
+template<>
+struct AccumulationTraits<float> {
+    using AccT = double;
+    static constexpr AccT zero() {
+        return 0;
+    }
+};
+template<>
+struct AccumulationTraits<BigInt> {
+    using AccT = BigInt;
+    static BigInt zero() {
+        return BigInt{0};
+    }
+};
+
+AccT total = AccumulationTraits<T>::zero(); // init total by trait
+function
+```
+
+现在很明了了，萃取是一种能够提供所有所需要的调用参数的信息的手段。
+
+还可以有参数化的萃取，即满足某些特殊的需求：
+
+```c++
+#ifndef ACCUM_HPP
+#define ACCUM_HPP
+#include "accumtraits4.hpp"
+template<typename T, typename AT = AccumulationTraits<T>>
+auto accum (T const* beg, T const* end)
+{
+typename AT::AccT total = AT::zero();
+    while (beg != end) {
+        total += *beg;
+        ++beg;
+    }
+    return total;
+}
+#endif //ACCU
+```
+
+### 萃取还是策略以及策略类
+
+除了上文的求和，我们也可以求积，如果是字符串可以将它们连接起来，即便是求一个序列中的最大值，也可以转化为一个累积问题，在上面的例子中，唯一需要变的操作是total += *beg。我们可以称这一操作为累积操作中的一个策略：
+
+```c++
+#ifndef ACCUM_HPP
+#define ACCUM_HPP
+#include "accumtraits4.hpp"
+#include "sumpolicy1.hpp"
+template<typename T,
+typename Policy = SumPolicy,
+typename Traits = AccumulationTraits<T>>
+auto accum (T const* beg, T const* end)
+{
+    using AccT = typename Traits::AccT;
+    AccT total = Traits::zero();
+    while (beg != end) {
+    Policy::accumulate(total, *beg);
+    	++beg;
+    }
+    return total;
+}
+#endif //ACCUM_HP
+
+#ifndef SUMPOLICY_HPP
+#define SUMPOLICY_HPP
+class SumPolicy {
+public:
+    template<typename T1, typename T2>
+    static void accumulate (T1& total, T2 const& value) {
+    	total += value;
+    }
+};
+#endif //SUMPOLICY
+
+#include "accum6.hpp"
+#include <iostream>
+class MultPolicy {
+public:
+    template<typename T1, typename T2>
+    static void accumulate (T1& total, T2 const& value) {
+    	total *= value;
+    }
+};
+int main()
+{
+    // create array of 5 integer values
+    int num[] = { 1, 2, 3, 4, 5 };
+    // print product of all values
+    std::cout << "the product of the integer values is " <<
+    accum<int,MultPolicy>(num, num+5) << ’\n’;
+}
+```
+
+策略和萃取有很多相似点，只是它们更侧重于行为，而不是类型。
+
+上述的示例是用有成员模板的常规类实现的，也可以使用类模板设计策略类接口的方式，此时就可以当作模板模板参数使用：
+
+```c++
+#ifndef SUMPOLICY_HPP
+#define SUMPOLICY_HPP
+template<typename T1, typename T2>
+class SumPolicy {
+public:
+    static void accumulate (T1& total, T2 const& value) {
+	    total += value;
+    }
+};
+#endif //
+
+#ifndef ACCUM_HPP#define ACCUM_HPP
+#include "accumtraits4.hpp"
+#include "sumpolicy2.hpp"
+template<typename T,
+template<typename,typename> class Policy = SumPolicy,
+typename Traits = AccumulationTraits<T>>
+auto accum (T const* beg, T const* end)
+{
+    using AccT = typename Traits::AccT;
+    AccT total = Traits::zero();
+    while (beg != end) {
+        Policy<AccT,T>::accumulate(total, *beg);
+        ++beg;
+	}
+	return total;
+}
+#endif//ACCUM_HPP
+```
+
+通过模板模板参数访问策略类的主要优势是让一个策略类通过一个依赖于模板参数的类型携带一些状态信息会更容易一些。
+
+### 类型函数
+
+传统上我们定义的函数可以称之为值函数，它们接收一些值作为参数并返回一个值作为结果，对于模板，还可以定义类型函数：它们接收一些类型作为参数并返回一个类型或者常量作为结果，比如：
+
+```c++
+template<typename T>
+struct TypeSize {
+	static std::size_t const value = sizeof(T);
+};
+int main()
+{
+    std::cout << "TypeSize<int>::value = " << TypeSize<int>::value << ’
+    \n’;
+}
+```
+
+我们希望有这样一个类型函数，当给与一个容器类型时，它可以返回相应的元素类型，这可以通过偏特化实现：
+
+```c++
+#include <vector>
+#include <list>
+template<typename T>
+struct ElementT; // primary template
+template<typename T>
+struct ElementT<std::vector<T>> { //partial specialization for
+std::vector
+	using Type = T;
+};
+template<typename T>
+struct ElementT<std::list<T>> { //partial specialization for std::list
+	using Type = T;
+};
+
+#include "elementtype.hpp"
+#include <vector>
+#include <iostream>
+#include <typeinfo>
+template<typename T>
+void printElementType (T const& c)
+{
+    std::cout << "Container of " <<
+    typeid(typename ElementT<T>::Type).name() << " elements.\n";
+}
+int main()
+{
+    std::vector<bool> s;
+    printElementType(s);
+    int arr[42];
+    printElementType(arr);
+}
+```
+
+这是在不知道具体类型函数存在的情况下去实现类型函数，但在某些情况下，类型函数是和其所适用的类型一起被设计的，此时实现就可被简化：
+
+```c++
+template<typename C>
+struct ElementT {
+	using Type = typename C::value_type;
+};
+```
+
+虽然如此，依然建议为类模板的类型参数提供相应的成员类型定义，这样在泛型代码中更容易访问它们，如：
+
+```c++
+template<typename T1, typename T2, …>
+class X {
+public:
+    using … = T1;
+    using … = T2; …
+};
+```
+
+除了可以被用来访问主参数类型的某些特性，萃取还可以被用来做类型转换，比如为某个类型添加或移除引用、const以及volatile限制符。
+
+比如我们可以实现一个RemoveReferenceT萃取，将引用类型转换为底层对象或函数的类型，非引用类型不变：
+
+```c++
+template<typename T>
+struct RemoveReferenceT {
+	using Type = T;
+};
+template<typename T>
+struct RemoveReferenceT<T&> {
+	using Type = T;
+};
+template<typename T>
+struct RemoveReferenceT<T&&> {
+	using Type = T;
+};
+template<typename T>
+using RemoveReference = typename RemoveReference<T>::Type;
+```
+
+标准库提供了std::remove_reference<>萃取。
+
+也可以添加引用：
+
+```c++
+template<typename T>
+struct AddLValueReferenceT {
+using Type = T&;
+};
+template<typename T>
+using AddLValueReference = typename AddLValueReferenceT<T>::Type;
+template<typename T>
+struct AddRValueReferenceT {
+using Type = T&&;
+};
+template<typename T>
+using AddRValueReference = typename AddRValueReferenceT<T>::Type;
+```
+
+如果不对其进行偏特化的话，用别名模板就可以了：
+
+```c++
+template<typename T>
+using AddLValueReferenceT = T&;
+template<typename T>
+using AddRValueReferenceT = T&&
+```
+
+这样对void类型可能不适用，因此可以有些特化的实现：
+
+```c++
+template<>
+struct AddLValueReferenceT<void> {
+	using Type = void;
+};
+template<>
+struct AddLValueReferenceT<void const> {
+	using Type = void const;
+};
+template<>
+struct AddLValueReferenceT<void volatile> {
+	using Type = void volatile;
+};
+template<>
+struct AddLValueReferenceT<void const volatile> {
+	using Type = void const volatile;
+}；
+```
+
+有了这些偏特化之后，上述别名模板必须被实现为类模板，因为别名模板不能被特化。C++有相应的std::add_lvalue_reference<>和std::add_rvalue_reference<>。
+
+我们也可以移除限制符：
+
+```c++
+template<typename T>
+struct RemoveConstT {
+	using Type = T;
+};
+template<typename T>
+struct RemoveConstT<T const> {
+	using Type = T;
+};
+template<typename T>
+using RemoveConst = typename RemoveConstT<T>::Type;
+```
+
+转换萃取也可以是多功能的，比如创建一个可用来移除const和volatile的RemoveCVT萃取：
+
+```c++
+#include "removeconst.hpp"
+#include "removevolatile.hpp"
+template<typename T>
+struct RemoveCVT : RemoveConstT<typename RemoveVolatileT<T>::Type>
+{
+};
+template<typename T>
+using RemoveCV = typename RemoveCVT<T>::Type;
+```
+
+其别名模板可以被进一步简化为：
+
+```c++
+template<typename T>
+using RemoveCV = RemoveConst<RemoveVolatile<T>>;
+```
+
+处理函数到指针的退化：
+
+```c++
+template<typename R, typename… Args>
+struct DecayT<R(Args…)> {
+	using Type = R (*)(Args…);
+};
+template<typename R, typename… Args>
+struct DecayT<R(Args…, …)> {
+    using Type = R (*)(Args…, …);
+};
+```
+
+第二种用来C风格的可变参。
+
+预测型萃取，会返回其他的类型，比如判断两个类型是否相等：
+
+```c++
+template<typename T1, typename T2>
+struct IsSameT {
+	static constexpr bool value = false;
+};
+template<typename T>
+struct IsSameT<T, T> {
+	static constexpr bool value = true;
+};
+
+```
+
+我们可以设法定义一个别名模板：
+
+```c++
+template<typename T1, typename T2>
+constexpr bool isSame = IsSameT<T1, T2>::value;
+```
+
+标准库提供了std::is_same<>。
+
+通过为可能的输出结果true和false提供不同的类型，可以大大提高对IsSameT的定义，比如声明一个BoolConstant模板以及两个可能的实例TrueType和FalseType：
+
+```c++
+template<bool val>
+struct BoolConstant {
+using Type = BoolConstant<val>;
+static constexpr bool value = val;
+};
+using TrueType = BoolConstant<true>;
+using FalseType = BoolConstant<false>;
+```
+
+默认提供了成员value。至于判断两个类型是否匹配，可以让相应的IsSameT分别继承：
+
+```c++
+#include "boolconstant.hpp"
+template<typename T1, typename T2>
+struct IsSameT : FalseType{};
+template<typename T>
+struct IsSameT<T, T> : TrueType{};
+```
+
+这样IsSameT\<T, int\>的返回类型会被隐式的转换为基类TrueType或者FalseType，这样不仅提供了value成员，还允许在编译期间将相应的需求派发到对应的函数实现或模板的偏特化：
+
+```c++
+#include "issame.hpp"
+#include <iostream>
+template<typename T>
+void fooImpl(T, TrueType)
+{
+	std::cout << "fooImpl(T,true) 
+}
+template<typename T>
+void fooImpl(T, FalseType)
+{
+	std::cout << "fooImpl(T,false) for other type called\n";
+}
+template<typename T>
+void foo(T t)
+{
+    fooImpl(t, IsSameT<T,int>{}); // choose impl. depending on whether T
+    is int
+}
+int main()
+{
+    foo(42); // calls fooImpl(42, TrueType)
+    foo(7.7); // calls fooImpl(42, FalseType)
+}
+```
+
+从11开始标准库提供了std::true_type和std::false_type。
+
+另外还有结果类型萃取，例如对混合类型进行求和，比如：
+
+```c++
+template<typename T1, typename T2>
+struct PlusResultT {
+using Type = decltype(T1() + T2());
+};
+template<typename T1, typename T2>
+using PlusResult = typename PlusResultT<T1, T2>::Type;
+
+template<typename T1, typename T2>
+Array<typename PlusResultT<T1, T2>::Type>
+operator+ (Array<T1> const&, Array<T2> const&);
+```
+
+以上的方法需要对T1和T2进行值初始化，这两个类型需要有可访问的、未被删除的默认构造函数。要想规避这点，可以使用std::declval<>，其可以在不需要默认构造函数的情况下为类型T生成一个值，变动如下：
+
+```c++
+#include <utility>
+template<typename T1, typename T2>
+struct PlusResultT {
+	using Type = decltype(std::declval<T1>() + std::declval<T2>());
+};
+template<typename T1, typename T2>
+using PlusResult = typename PlusResultT<T1, T2>::Type;
+```
+
+### 基于SFINAE的萃取
+
+可以用来在编译期间判断特定类型和表达式的有效性，比如可以通过萃取来判断一个类型是否有某个特定的成员，是否支持某个特定的操作，或者该类型本身是不是一个类。基于SFINAE的两个主要技术是：用SFINAE排除某些重载函数，以及用SFINAE排除某些偏特化。
+
+一个基础的实现如下：
+
+```c++
+#include "issame.hpp"
+template<typename T>
+struct IsDefaultConstructibleT {
+private:
+    // test() trying substitute call of a default constructor for
+    //T passed as U :
+    template<typename U, typename = decltype(U())>
+    static char test(void*);// test() fallback:
+    template<typename>
+    static long test(…);
+public:
+    static constexpr bool value =
+    IsSameT<decltype(test<T>(nullptr)), char>::value;
+};
+
+IsDefaultConstructibleT<int>::value //yields true
+struct S {
+	S() = delete;
+};
+IsDefaultConstructibleT<S>::value //yield
+```
+
+第一个重载函数只有在所需的检查成功时才会被匹配，第二个则是应急的。这里对U()的结果施加了deltype操作，这样就可以用结果初始化一个类型参数了。
+
+注意，不能在第一个test声明里直接使用模板参数，因为所有参数为T的成员函数都会被执行模板参数替换，对于一个不可默认构造的类型会直接报错。
+
+还有另一种实现策略，比较老式的：
+
+```c++
+template<…> static char test(void*);
+template<…> static long test(...);
+enum { value = sizeof(test<…>(0)) == 1};
+```
+
+会基于返回值类型的大小判断使用了哪个重载函数。然而，在某些平台上，sizeof(char)的值可能等于sizeof(long)的值，为了确保返回值类型在所有的平台上都有不同的值，可以如下操作：
+
+```c++
+using Size1T = char;
+using Size2T = struct { char a[2]; };
+//或者
+using Size1T = char(&)[1];
+using Size2T = char(&)[2];
+
+template<…> static Size1T test(void*); // checking test()
+template<…> static Size2T test(…); // fallback
+```
+
+如前文所述，返回bool值的萃取，应该返回一个继承自std::true_type或std::false_type的值，使用这一方式，也可以解决某些平台sizeof(char)==sizeof(long)的问题。为了实现这个，需要定义一个IsDefaultConstructibleT，该萃取本身继承一个辅助类的Type成员，该辅助类会返回需要的基类。我们可以简单的将test的返回值类型用作对应的基类，如果匹配成功，继承的就是true_type，否则就是false_type。示例如下：
+
+```c++
+#include <type_traits>
+template<typename T>
+struct IsDefaultConstructibleHelper {
+private:
+    // test() trying substitute call of a default constructor for
+    T passed as U:
+    template<typename U, typename = decltype(U())>
+    static std::true_type test(void*);
+    // test() fallback:
+    template<typename>
+    static std::false_type test(…);
+public:
+	using Type = decltype(test<T>(nullptr));
+};
+template<typename T>
+struct IsDefaultConstructibleT :
+IsDefaultConstructibleHelper<T>::Type {
+};
+```
+
+下面使用偏特化的方式来判断T是否可以被初始化：
+
+```c++
+// 别名模板，helper to ignore any number of template parameters:
+template<typename …> using VoidT = void;
+// primary template:
+template<typename, typename = VoidT<>>
+struct IsDefaultConstructibleT : std::false_type
+{ };
+// partial specialization (may be SFINAE’d away):
+template<typename T>
+struct IsDefaultConstructibleT<T, VoidT<decltype(T())>> :
+std::true_type
+{ };
+```
+
+这里跟前文的例子有些类似，有意思的是第二个模板参数的默认值被设定为一个辅助别名模板VoidT，这使得我们能够定义各种使用了任意数量的编译期类型构造的偏特化。如果对于某个特定类型T，其默认构造函数无效，那么SIFINEAE就使得该偏特化被丢弃，并最终使用主模板，否则该偏特化就是有效的。17标准库引入了与VoidT对应的类型萃取std::void_t<>，__cpp_lib_void_t被用来标识一个库中是否实现了std::void_t宏。
+
+还可以将泛型lambda用于SFINAE，比如：
+
+```c++
+#include <utility>
+// helper: checking validity of f (args…) for F f and Args… args:
+template<typename F, typename… Args,
+typename = decltype(std::declval<F>() (std::declval<Args&&>()…))>
+std::true_type isValidImpl(void*);
+// fallback if helper SFINAE’d out:
+template<typename F, typename… Args>
+std::false_type isValidImpl(…);
+// define a lambda that takes a lambda f and returns whether calling
+f with args is valid
+inline constexpr
+auto isValid = [](auto f) {
+    return [](auto&&… args) {
+        return decltype(isValidImpl<decltype(f),
+        	decltype(args)&&…>(nullptr)){};
+    };
+};
+// helper template to represent a type as a value
+template<typename T>
+struct TypeT {
+	using Type = T;
+};
+// helper to wrap a type as a value
+template<typename T>
+constexpr auto type = TypeT<T>{};
+// helper to unwrap a wrapped type in unevaluated contexts
+template<typename T>
+T valueT(TypeT<T>); // no definition
+```
+
+17之前，lambda表达式不能出现在const表达式中，因此上述代码只有在17中才有效。
+
+### IsConvertibleT
+
+示例是一种判断一种类型是否可以转换成另外一种类型的萃取：
+
+```c++
+#include <type_traits> // for true_type and false_type
+#include <utility> // for declval
+template<typename FROM, typename TO>
+struct IsConvertibleHelper {
+private:
+    // test() trying to call the helper aux(TO) for a FROM passed as F :
+    static void aux(TO);
+    template<typename F, typename T,
+    typename = decltype(aux(std::declval<F>()))>
+    static std::true_type test(void*);
+    // test() fallback:
+    template<typename, typename>
+    static std::false_type test(…);
+public:
+	using Type = decltype(test<FROM>(nullptr));
+};
+template<typename FROM, typename TO>
+struct IsConvertibleT : IsConvertibleHelper<FROM, TO>::Type {
+};
+template<typename FROM, typename TO>
+using IsConvertible = typename IsConvertibleT<FROM, TO>::Type;
+template<typename FROM, typename TO>
+constexpr bool isConvertible = IsConvertibleT<FROM, TO>::value;
+```
+
+为了处理一些特殊情况，为辅助类模板引入一个额外的模板参数：
+
+```c++
+template<typename FROM, typename TO, bool = IsVoidT<TO>::value ||
+IsArrayT<TO>::value || IsFunctionT<TO>::value>
+struct IsConvertibleHelper {
+    using Type = std::integral_constant<bool, IsVoidT<TO>::value &&
+    IsVoidT<FROM>::value>;
+};
+template<typename FROM, typename TO>
+struct IsConvertibleHelper<FROM,TO,false> { … //previous implementation of IsConvertibleHelper here
+};
+```
+
+标准库里对应的实现为std::is_convertible<>。
+
+### 探测成员
+
+另一种基于SFINAE的萃取的应用是创建一个可以判断一个给定类型T是否含有名为x的成员的萃取。实现如下：
+
+```c++
+#include <type_traits>
+// defines true_type and false_type
+// helper to ignore any number of template parameters:
+template<typename …> using VoidT = void;
+// primary template:
+template<typename, typename = VoidT<>>
+struct HasSizeTypeT : std::false_type
+{};
+// partial specialization (may be SFINAE’d away):
+template<typename T>
+struct HasSizeTypeT<T, VoidT<typename T::size_type>> : std::true_type
+{} ;
+```
+
+注意，如果类型成员size_type是私有的，那么HasSizeTypeT会返回false，因为这个萃取模板没有访问该类型的特殊权限，也就是说，该萃取实际是测试我们是否能够访问类型成员size_type。
+
+还要注意处理引用类型：
+
+```c++
+struct CXR {
+	using size_type = char&; // Note: type size_type is a reference type
+};
+std::cout << HasSizeTypeT<CXR>::value; // OK: prints true
+std::cout << HasSizeTypeT<CXR&>::value; // OOPS: prints false
+std::cout << HasSizeTypeT<CXR&&>::value; // OOPS: prints false
+```
+
+引用类型确实没有成员，为了让它正常，我们需要使用removeReference萃取，使得模板参数是其指向的类型：
+
+```c++
+template<typename T>
+struct HasSizeTypeT<T, VoidT<RemoveReference<T>::size_type>> :
+std::true_type {
+};
+```
+
+注意，对于注入类的名字，上述检测类型成员的萃取也会返回true：
+
+```c++
+struct size_type {
+};
+struct Sizeable : size_type {
+};
+static_assert(HasSizeTypeT<Sizeable>::value, "Compiler bug: Injected
+class name missing")
+```
+
+这是因为size_type会将其自身的名字当作类型成员，而且这一成员会被继承。
+
+在定义了诸如HasSizeTypeT的萃取之后，很自然想要将其参数化，以对任意名称的类型成员探测。然而，目前这一功能只能通过宏来实现，否则就使用泛型lambda：
+
+```c++
+#include <type_traits> // for true_type, false_type, and void_t
+#define
+DEFINE_HAS_TYPE(MemType) \
+template<typename, typename = std::void_t<>> \
+struct HasTypeT_##MemType \
+: std::false_type {
+}; \
+template<typename T> \
+struct HasTypeT_##MemType<T, std::void_t<typename T::MemType>> \
+: std::true_type { } // ; intentionally skipped
+
+#include "hastype.hpp"
+#include <iostream>
+#include <vector>
+DEFINE_HAS_TYPE(value_type);
+DEFINE_HAS_TYPE(char_type);
+int main()
+{
+std::cout << "int::value_type: " << HasTypeT_value_type<int>::value
+<< ’\n’;
+std::cout << "std::vector<int>::value_type: " <<
+HasTypeT_value_type<std::vector<int>>::value << ’\n’;
+std::cout << "std::iostream::value_type: " <<
+HasTypeT_value_type<std::iostream>::value << ’\n’;
+std::cout << "std::iostream::char_type: " <<
+HasTypeT_char_type<std::iostream>::value << ’\n’;
+}
+```
+
+还可以修改上述萃取，使其能够测试数据成员和成员函数：
+
+```c++
+#include <type_traits> // for true_type, false_type, and void_t
+#define
+DEFINE_HAS_MEMBER(Member) \
+template<typename, typename = std::void_t<>> \
+struct HasMemberT_##Member \
+: std::false_type { }; \
+template<typename T> \
+struct HasMemberT_##Member<T,
+std::void_t<decltype(&T::Member)>> \
+: std::true_type { } // ; intentionally skipped
+```
+
+当&::Member无效的时候，偏特化实现会被SFINAE掉，为了使条件有效，必须满足：
+
+- Member必须是能够被识别出没有歧义的T的一个成员（不能是重载成员，也不能是多重继承中名字相同的成员的名字）；
+- 成员必须可访问；
+- 成员必须是非类型成员以及非枚举成员（否则前面的&会无效）；
+- 如果是static成员，那么对应的类型必须没有使得&T::member无效的operator&；
+
+这种方式只可以用来测试是否存在唯一一个与特定名称对应的成员。当然我们是可以简单测试是否可以调用某个函数，即便它是重载的：
+
+```c++
+#include <utility> // for declval
+#include <type_traits> // for true_type, false_type, and void_t
+// primary template:
+template<typename, typename = std::void_t<>>
+struct HasBeginT : std::false_type {
+};
+// partial specialization (may be SFINAE’d away):
+template<typename T>
+struct HasBeginT<T, std::void_t<decltype(std::declval<T>
+().begin())>> : std::true_type {
+};
+```
+
+我们甚至可以探测多个表达式的组合：
+
+```c++
+#include <utility> // for declval
+#include <type_traits> // for true_type, false_type, and void_t
+// primary template:
+template<typename, typename, typename = std::void_t<>>
+struct HasLessT : std::false_type
+{};
+// partial specialization (may be SFINAE’d away):
+template<typename T1, typename T2>
+struct HasLessT<T1, T2, std::void_t<decltype(std::declval<T1>() <
+std::declval<T2>())>>: std::true_type
+{};
+```
+
+以下介绍使用泛型Lambda探测成员：
+
+```c++
+#include "isvalid.hpp"
+#include<iostream>
+#include<string>
+#include<utility>
+int main()
+{
+    using namespace std;
+    cout << boolalpha;
+    // define to check for data member first:
+    constexpr auto hasFirst = isValid([](auto x) ->
+    decltype((void)valueT(x).first) {});
+    cout << "hasFirst: " << hasFirst(type<pair<int,int>>) << ’\n’; //
+    true
+    // define to check for member type size_type:
+    constexpr auto hasSizeType = isValid([](auto x) -> typename
+    decltype(valueT(x))::size_type { });
+    struct CX {
+   		using size_type = std::size_t;
+    };
+    cout << "hasSizeType: " << hasSizeType(type<CX>) << ’\n’; // true
+    if constexpr(!hasSizeType(type<int>)) {
+        cout << "int has no size_type\n"; 
+        …	
+	}
+    // define to check for <:
+    constexpr auto hasLess = isValid([](auto x, auto y) ->
+    decltype(valueT(x) < valueT(y)) {});
+    cout << hasLess(42, type<char>) << ’\n’; //yields true
+    cout << hasLess(type<string>, type<string>) << ’\n’; //yields true
+	cout << hasLess(type<string>, type<int>) << ’\n’; //yields false
+	cout << hasLess(type<string>, "hello") << ’\n’; //yields true
+}
+```
+
+### 其他的萃取技术
+
+ifThenElse类型模板接受一个bool型模板参数，并根据该参数从另外两个类型参数中做选择：
+
+```c++
+#ifndef IFTHENELSE_HPP
+#define IFTHENELSE_HPP
+// primary template: yield the second argument by default and rely on
+// a partial specialization to yield the third argument
+// if COND is false
+template<bool COND, typename TrueType, typename FalseType>
+struct IfThenElseT {
+	using Type = TrueType;
+};
+// partial specialization: false yields third argument
+template<typename TrueType, typename FalseType>
+struct IfThenElseT<false, TrueType, FalseType> {
+	using Type = FalseType;
+};
+template<bool COND, typename TrueType, typename FalseType>
+using IfThenElse = typename IfThenElseT<COND, TrueType,
+FalseType>::Type;
+#endif //IFTHENELSE_HPP
+
+```
+
+注意，此模型在最终选择之前，then和else分支的模板参数都会计算，因此要保证两个分支都没有问题。以下这个例子就不行：
+
+```c++
+// ERROR: undefined behavior if T is bool or no integral type:
+template<typename T>
+struct UnsignedT {
+    using Type = IfThenElse<std::is_integral<T>::value
+    && !std::is_same<T,bool>::value, typename std::make_unsigned<T>::type,
+    T>;
+};
+```
+
+因为在实例化UnsignedT\<bool\>的时候，typename std::make_unsigned\<T\>会报错。为了解决这一问题，需要再引入一层额外的间接层，从而让IfThenElse的参数本身用类型函数去封装结果：
+
+```c++
+// yield T when using member Type:
+template<typename T>
+struct IdentityT {
+	using Type = T;
+};
+// to make unsigned after IfThenElse was evaluated:
+template<typename T>
+struct MakeUnsignedT {
+	using Type = typename std::make_unsigned<T>::type;
+};
+template<typename T>
+struct UnsignedT {
+    using Type = typename IfThenElse<std::is_integral<T>::value
+    && !std::is_same<T,bool>::value,
+    MakeUnsignedT<T>,
+    IdentityT<T>
+    >::Type;
+};
+```
+
+这样一来，在最终IfThenElse做出选择之前，类型函数不会真正计算，而是由IfThenElse选择合适类型实例。之所以能够这么做是因为未被选择的封装类型永远不会完全实例化。
+
+标准库中与之对应的模板为std::conditional<>。
+
+还可以使用萃取探测不抛出异常的操作，比如探测pair的移动构造函数抛出异常：
+
+```c++
+Pair(Pair&& other)
+noexcept(IsNothrowMoveConstructibleT<T1>::value &&
+IsNothrowMoveConstructibleT<T2>::value)
+: first(std::forward<T1>(other.first)),
+second(std::forward<T2>(other.second))
+{}
+
+#include <utility> // for declval
+#include <type_traits> // for bool_constant
+template<typename T>
+struct IsNothrowMoveConstructibleT
+: std::bool_constant<noexcept(T(std::declval<T>()))>
+{};
+```
+
+该实现还可以继续优化，因为其不是SFINAE友好的，在真正做计算之前，要判断用来计算结果的表达式是否有效，这里增加一个默认值为void的模板参数，并根据移动构造函数是否可用对其偏特化：
+
+```c++
+#include <utility> // for declval
+#include <type_traits> // for true_type, false_type, and
+bool_constant<>
+// primary template:
+template<typename T, typename = std::void_t<>>
+struct IsNothrowMoveConstructibleT : std::false_type
+{ };
+// partial specialization (may be SFINAE’d away):
+template<typename T>
+struct IsNothrowMoveConstructibleT<T,
+std::void_t<decltype(T(std::declval<T>()))>>
+: std::bool_constant<noexcept(T(std::declval<T>()))>
+{};
+```
+
+标准库对应的萃取为std::is_move_constructible<>。
+
+使用别名模板包装萃取可以使得代码简洁，但也有一些缺点：
+
+1. 别名模板不能被特化；
+2. 对别名模板的使用最终会让该类型被实例化，这样对于给定类型就很难避免对其进行无意义的实例化；
+
+对最后一点的表述指的是别名模板不能和元函数转发一起使用。
+
+对于返回数值的萃取需要使用一个::value来生成萃取的结果，在这种情况下，constexpr修饰的变量模板提供了一种简化代码的方法，比如：
+
+```c++
+template<typename T1, typename T2>
+constexpr bool IsSame = IsSameT<T1,T2>::value;
+template<typename FROM, typename TO>
+constexpr bool IsConvertible = IsConvertibleT<FROM, TO>::value;
+```
+
+14开始，对于类型萃取的type成员，一般别名模板会有一个\_t后缀，17开始对于value成员，与之对应的变量模板会有一个\_v后缀。
+
+### 类型分类
+
+主要用于判断模板参数的类型是内置类型、指针类型、class类型或等等。比如，我们定义一个可以判断某个类型是不是基础类型的模板，默认情况下，我们认为不是基础类型，对于基础类型则是进行了特化：
+
+```c++
+#include <cstddef> // for nullptr_t
+#include <type_traits> // for true_type, false_type, and
+bool_constant<>
+// primary template: in general T is not a fundamental type
+template<typename T>
+struct IsFundaT : std::false_type {
+};
+// macro to specialize for fundamental types
+#define MK_FUNDA_TYPE(T) \
+template<> struct IsFundaT<T> : std::true_type { \
+};
+MK_FUNDA_TYPE(void)
+MK_FUNDA_TYPE(bool)
+MK_FUNDA_TYPE(char)
+MK_FUNDA_TYPE(signed char)
+MK_FUNDA_TYPE(unsigned char)
+MK_FUNDA_TYPE(wchar_t)
+MK_FUNDA_TYPE(char16_t)
+MK_FUNDA_TYPE(char32_t)
+MK_FUNDA_TYPE(signed short)
+MK_FUNDA_TYPE(unsigned short)
+MK_FUNDA_TYPE(signed int)
+MK_FUNDA_TYPE(unsigned int)
+MK_FUNDA_TYPE(signed long)
+MK_FUNDA_TYPE(unsigned long)
+MK_FUNDA_TYPE(signed long long)
+MK_FUNDA_TYPE(unsigned long long)
+MK_FUNDA_TYPE(float)
+MK_FUNDA_TYPE(double)
+MK_FUNDA_TYPE(long double)
+MK_FUNDA_TYPE(std::nullptr_t)
+#undef MK_FUNDA_TYPE
+```
+
+对于指针类型，可以有以下的实现：
+
+```c++
+template<typename T>
+struct IsPointerT : std::false_type { //primary template: by default
+not a pointer
+};
+template<typename T>
+struct IsPointerT<T*> : std::true_type { //partial specialization for
+pointers
+    using BaseT = T; // type pointing to
+};
+```
+
+左值引用和右值引用也与之类似：
+
+```c++
+template<typename T>
+struct IsLValueReferenceT : std::false_type { //by default no lvalue
+reference
+};
+template<typename T>
+struct IsLValueReferenceT<T&> : std::true_type { //unless T is lvalue
+references
+	using BaseT = T; // type referring to
+};
+
+template<typename T>
+struct IsRValueReferenceT : std::false_type { //by default no rvalue
+reference
+};
+template<typename T>
+struct IsRValueReferenceT<T&&> : std::true_type { //unless T is rvalue
+reference
+	using BaseT = T; // type referring to
+};
+```
+
+两者又可组合成IsReferenceT<>萃取：
+
+```c++
+#include "islvaluereference.hpp"
+#include "isrvaluereference.hpp"
+#include "ifthenelse.hpp"
+template<typename T>
+class IsReferenceT
+: public IfThenElseT<IsLValueReferenceT<T>::value,
+    IsLValueReferenceT<T>,
+    IsRValueReferenceT<T>
+    >::Type {
+};
+```
+
+对于数组的萃取，其偏特化的模板参数要比主模板要多：
+
+```c++
+#include <cstddef>
+template<typename T>
+struct IsArrayT : std::false_type { //primary template: not an array
+};
+template<typename T, std::size_t N>
+struct IsArrayT<T[N]> : std::true_type { //partial specialization for
+arrays
+    using BaseT = T;
+    static constexpr std::size_t size = N;
+};
+template<typename T>
+struct IsArrayT<T[]> : std::true_type { //partial specialization for
+unbound arrays
+    using BaseT = T;
+    static constexpr std::size_t size = 0;
+};
+```
+
+判断指向成员的指针：
+
+```c++
+template<typename T>
+struct IsPointerToMemberT : std::false_type { //by default no
+pointer-to-member
+};
+template<typename T, typename C>
+struct IsPointerToMemberT<T C::*> : std::true_type { //partial
+specialization
+    using MemberT = T;
+    using ClassT = C;
+};
+```
+
+识别函数类型比较复杂，要用参数包来捕获所有的参数：
+
+```c++
+#include "../typelist/typelist.hpp"
+template<typename T>
+struct IsFunctionT : std::false_type { //primary template: no function
+};
+template<typename R, typename… Params>
+struct IsFunctionT<R (Params…)> : std::true_type
+{ //functions
+    using Type = R;
+    using ParamsT = Typelist<Params…>;
+    static constexpr bool variadic = false;
+};
+template<typename R, typename… Params>
+struct IsFunctionT<R (Params…, …)> : std::true_type { //variadic
+functions
+    using Type = R;
+    using ParamsT = Typelist<Params…>;
+    static constexpr bool variadic = true;
+};
+```
+
+然而，这些并不能包含所有的函数类型，因为函数类型可能带一些修饰符。
+
+判断class的类型比较困难，但我们可以利用以下的特性：只有class类型可以被用于指向成员的指针类型的基础，即X Y::*中Y只能是class类型：
+
+```c++
+#include <type_traits>
+template<typename T, typename = std::void_t<>>
+struct IsClassT : std::false_type { //primary template: by default no
+class
+};
+template<typename T>
+struct IsClassT<T, std::void_t<int T::*>> // classes can have
+pointer-to-member
+: std::true_type {
+};
+```
+
+### 策略萃取
+
+前文所述的萃取大多是判断模板参数的特性，这一类叫做特性萃取，但有些萃取定义的是如何处理某些数据，这种叫做策略萃取。比如为了处理拷贝可能的代价，定义策略萃取模板将预期的参数类型T映射到最佳的参数类型T或者T const&：
+
+```c++
+template<typename T>
+struct RParam {
+using Type = typename IfThenElseT<sizeof(T) <=2*sizeof(void*),
+    T,
+    T const&>::Type;
+};
+template<typename T>
+struct RParam<Array<T>> {
+using Type = Array<T> const&;
+};
+
+#include "rparam.hpp"
+#include "rparamcls.hpp"
+// function that allows parameter passing by value or by reference
+template<typename T1, typename T2>
+void foo (typename RParam<T1>::Type p1, typename RParam<T2>::Type p2)
+{ …
+}
+int main()
+{
+    MyClass1 mc1;
+    MyClass2 mc2;
+    foo<MyClass1,MyClass2>(mc1,mc2);
+}
+```
+
+这样也有缺点，那就是调用foo的时候不能使用参数推断，因为模板参数只能出现在函数参数的限制符中，因此调用时必须显式的指明模板参数，一种权宜之计是使用提供了完美转发的inline封装函数，但需要假设编译器将省略inline函数：
+
+```c++
+#include "rparam.hpp"
+#include "rparamcls.hpp"
+// function that allows parameter passing by value or by reference
+template<typename T1, typename T2>
+void foo_core (typename RParam<T1>::Type p1, typename RParam<T2>::Type
+p2)
+{ …
+}
+// wrapper to avoid explicit template parameter passing
+template<typename T1, typename T2>
+void foo (T1 && p1, T2 && p2)
+{
+	foo_core<T1,T2>(std::forward<T1>(p1),std::forward<T2>(p2));
+}
+int main()
+{
+    MyClass1 mc1;
+    MyClass2 mc2;
+    foo(mc1,mc2); // same as foo_core<MyClass1,MyClass2> (mc1,mc2)
+}
+```
+
+## 基于类型属性的重载
+
+### 算法特化
+
+在一个泛型算法中引入更为特化的变体，这一设计和优化方法称为算法特化，比如：
+
+```c++
+template<typename T>
+void swap(T& x, T& y)
+{
+    T tmp(x);
+    x = y;
+    y = tmp;
+}
+
+template<typename T>
+void swap(Array<T>& x, Array<T>& y)
+{
+    swap(x.ptr, y.ptr);
+    swap(x.len, y.len);
+}
+```
+
+### 标记派发
+
+算法特化的一个方式是用一个唯一的、可区分特定变体的类型来标记不同算法变体的实现，比如以下advanceIter算法的变体实现：
+
+```c++
+template<typename Iterator, typename Distance>
+void advanceIterImpl(Iterator& x, Distance n,
+std::input_iterator_tag)
+{
+    while (n > 0) { //linear time
+    ++x;
+    --n;
+}
+}
+template<typename Iterator, typename Distance>
+void advanceIterImpl(Iterator& x, Distance n,
+std::random_access_iterator_tag)
+{
+	x += n; // constant time
+}
+```
+
+然后通过advanceIter函数模板将其参数连同与之对应的tag一起转发出去：
+
+```c++
+template<typename Iterator, typename Distance>
+void advanceIter(Iterator& x, Distance n)
+{
+    advanceIterImpl(x, n, typename
+    std::iterator_traits<Iterator>::iterator_category())
+}
+
+namespace std {
+    struct input_iterator_tag { };
+    struct output_iterator_tag { };
+    struct forward_iterator_tag : public input_iterator_tag { };
+    struct bidirectional_iterator_tag : public forward_iterator_tag
+    { };
+    struct random_access_iterator_tag : public
+    bidirectional_iterator_tag { };
+}
+```
+
+当算法用到的特性具有天然的层次结构，并且存在一组为这些标记提供了值的萃取机制的时候标记派发可以很好的工作，如果算法特化依赖于专有类型属性的话，标记派发就没这么方便，需要更强大的技术。
+
+### Enable/Disable函数模板
+
+标准库提供了std::enable_if，这里实现一个辅助工具，引入了一个对应的模板别名，为了避免名称冲突，这里称之为EnableIf。实现如下：
+
+```c++
+template<bool, typename T = void>
+struct EnableIfT {
+};
+template< typename T>
+struct EnableIfT<true, T> {
+    using Type = T;
+};
+template<bool Cond, typename T = void>
+using EnableIf = typename EnableIfT<Cond, T>::Type;
+```
+
+有了这个辅助类，我们就可以实现随机访问版本的advanceIter算法：
+
+```c++
+template<typename Iterator>
+constexpr bool IsRandomAccessIterator =
+IsConvertible< typename std::iterator_traits<Iterator>::iterator_category,
+	std::random_access_iterator_tag>;
+template<typename Iterator, typename Distance>
+EnableIf<IsRandomAccessIterator<Iterator>>
+advanceIter(Iterator& x, Distance n){
+	x += n; // constant time
+}
+```
+
+EnableIf的使用意味着只有当Iterator参数是随机访问迭代器的时候函数模板才可以使用（而且返回类型为void），当不是时函数模板会从待选项移除。现在已经可以显式的为特定类型激活其所适用的模板，但还需要激活不够特化的模块，这里还使用了EnableIf：
+
+```c++
+template<typename Iterator, typename Distance>
+EnableIf<!IsRandomAccessIterator<Iterator>>
+advanceIter(Iterator& x, Distance n)
+{
+    while (n > 0) {//linear time
+        ++x;
+        --n;
+    }
+}
+```
+
+EnableIf通常用于函数模板的返回类型，但该方法不适用构造函数模板以及类型转换模板，因为其都没有指定返回类型，对于这一问题，可以将EnableIf嵌入一个默认模板参数来解决：
+
+```c++
+#include <iterator>
+#include "enableif.hpp"
+#include "isconvertible.hpp"
+template<typename Iterator>
+constexpr bool IsInputIterator = IsConvertible< typename
+std::iterator_traits<Iterator>::iterator_category,
+std::input_iterator_tag>;
+template<typename T>
+class Container {
+public:
+    // construct from an input iterator sequence:
+    template<typename Iterator, typename =
+    EnableIf<IsInputIterator<Iterator>>>
+    Container(Iterator first, Iterator last);
+    // convert to a container so long as the value types are convertible:
+    template<typename U, typename = EnableIf<IsConvertible<T, U>>>
+    operator Container<U>() const;
+};
+```
+
+但如果重载时可能就会出现错误，因此此时的重载可能只是模板参数不同，但模板参数不同恰恰不被认为是重载，解决方法是引入另一个模板参数：
+
+```c++
+// construct from an input iterator sequence:
+template<typename Iterator, typename =
+EnableIf<IsInputIterator<Iterator>
+&& !IsRandomAccessIterator<Iterator>>>
+Container(Iterator first, Iterator last);
+template<typename Iterator, typename = 
+EnableIf<IsRandomAccessIterator<Iterator>>, typename = int> // extra
+dummy parameter to enable both constructors
+Container(Iterator first, Iterator last); //
+```
+
+到了17，有了constexpr if，某些情况下就可以不使用EnableIf，比如可以这样重写advanceIter()：
+
+```c++
+template<typename Iterator, typename Distance>
+void advanceIter(Iterator& x, Distance n) {
+    if constexpr(IsRandomAccessIterator<Iterator>) {
+        // implementation for random access iterators:
+        x += n; // constant time
+    }else if constexpr(IsBidirectionalIterator<Iterator>) {
+        // implementation for bidirectional iterators:
+        if (n > 0)
+        	{for ( ; n > 0; ++x, --n) { //linear time for positive n
+            }
+        } else {
+                for ( ; n < 0; --x, ++n) { //linear time for negative n
+            }
+        }
+    }else {
+        // implementation for all other iterators that are at least input 	iterators:
+        if (n < 0) {
+        	throw "advanceIter(): invalid iterator category for negative n";
+        }
+        while (n > 0) { //linear time for positive n only
+            ++x;
+            --n;
+        }
+  	}
+}
+```
+
+### 类的特化
+
+类模板的偏特化可以被用来提供一个可选的、为特定模板参数进行了特化的实现，与函数模板的重载很像。这次的示例是一个以key和value的类型为模板参数的泛型Dictionary类模板，只要key提供了operator==运算符，就实现一个简单的Dictionary：
+
+```c++
+template<typename Key, typename Value>
+class Dictionary
+{
+private:
+	vector<pair<Key const, Value>> data;
+public:
+    //subscripted access to the data:
+    value& operator[](Key const& key)
+    {
+        // search for the element with this key:
+        for (auto& element : data) {
+            if (element.first == key){
+                return element.second;
+            }
+        }
+        // there is no element with this key; add one
+        data.push_back(pair<Key const, Value>(key, Value()));
+        return data.back().second;
+    }…
+};
+```
+
+为了将EnableIf用于类模板的偏特化，先为Dictionary引入一个未命名的、默认的模板参数：
+
+```
+template<typename Key, typename Value, typename = void>
+class Dictionary
+{ … // vector implementation as above
+};
+template<typename Key, typename Value>
+class Dictionary<Key, Value, EnableIf<HasLess<Key> && !HasHash<Key>>> 
+{ … // map implementation as above
+};
+template typename Key, typename Value>
+class Dictionary Key, Value, EnableIf HasHash Key>>>
+{
+private:
+	unordered_map Key, Value> data;
+public:
+    value& operator[](Key const& key) {
+    return data[key];
+    }…
+};
+```
+
+同样的，标记派发也可以被用于在不同模板特化版本之间做选择，比如实现一个Advance\<Iterator\>：
+
+```c++
+// primary template (intentionally undefined):
+template<typename Iterator,
+typename Tag = BestMatchInSet< typename
+std::iterator_traits<Iterator> ::iterator_category,
+std::input_iterator_tag,
+std::bidirectional_iterator_tag,
+std::random_access_iterator_tag>>
+class Advance;
+// general, linear-time implementation for input iterators:
+template<typename Iterator>
+class Advance<Iterator, std::input_iterator_tag>
+{
+public:
+    using DifferenceType = typename
+    std::iterator_traits<Iterator>::difference_type;
+    void operator() (Iterator& x, DifferenceType n) const
+    {
+        while (n > 0) {
+            ++x;
+            --n;
+        }
+    }
+};
+
+// bidirectional, linear-time algorithm for bidirectional iterators:
+template<typename Iterator>
+class Advance<Iterator, std::bidirectional_iterator_tag>
+{
+public:
+	using DifferenceType =typename
+    std::iterator_traits<Iterator>::difference_type;
+    void operator() (Iterator& x, DifferenceType n) const
+    {
+        if (n > 0) {
+            while (n > 0) {
+                ++x;
+                --n;
+            }
+        } else {
+        while (n < 0) {
+            --x;
+            ++n;
+            }
+        }
+    }
+};
+// bidirectional, constant-time algorithm for random access iterators:
+template<typename Iterator>
+class Advance<Iterator, std::random_access_iterator_tag>
+{
+public:
+    using DifferenceType =
+    typename std::iterator_traits<Iterator>::difference_type;
+    void operator() (Iterator& x, DifferenceType n) const
+    {
+        x += n;
+    }
+}
+```
+
+这里面比较困难的就是BestMatchInSet的实现，使用了重载解析：
+
+```c++
+// construct a set of match() overloads for the types in Types…:
+template<typename… Types>
+struct MatchOverloads;
+// basis case: nothing matched:
+template<>
+struct MatchOverloads<> {
+	static void match(…);
+};
+// recursive case: introduce a new match() overload:
+template<typename T1, typename… Rest>
+struct MatchOverloads<T1, Rest…> : public MatchOverloads<Rest…>
+{
+    static T1 match(T1); // introduce overload for T1
+    using MatchOverloads<Rest…>::match;// collect overloads from bases
+};
+// find the best match for T in Types…
+template<typename T, typename… Types>
+struct BestMatchInSetT {
+	using Type = decltype(MatchOverloads<Types…>::match(declval<T> ()));
+};
+template<typename T, typename… Types>
+using BestMatchInSet = typename BestMatchInSetT<T, Types…>::Type;
+```
+
+## 模板和继承
+
+### 空基类优化
+
+标准指出，在空类被用作基类时，如果不给它分配内存并不会导致其被存储到与其他同类型对象或者字对象的地址上，那么就可以不给它分配内存：
+
+```c++
+#include <iostream>
+class Empty {
+using Int = int;// type alias members don’t make a class nonempty
+};
+class EmptyToo : public Empty {
+};
+class EmptyThree : public EmptyToo {
+}；
+int main()
+{
+    std::cout << "sizeof(Empty): " << sizeof(Empty) << ’\n’;
+    std::cout << "sizeof(EmptyToo): " << sizeof(EmptyToo) << ’\n’;
+    std::cout << "sizeof(EmptyThree): " << sizeof(EmptyThree) << ’\n’;
+}
+```
+
+如果编译期实现了EBCO，那么打印出来的三个类大小将是相同的，但是它们的结果也都不会是0，这意味着实现了空基类的优化，如果三个类大小不同，意味着没有实现EBCO。考虑一种EBCO不适用的情况：
+
+```c++
+#include <iostream>!
+class Empty {
+using Int = int; // type alias members don’t make a class nonempty
+};
+class EmptyToo : public Empty {
+};
+class NonEmpty : public Empty, public EmptyToo {
+};
+int main(){
+    std::cout <<"sizeof(Empty): " << sizeof(Empty) <<’\n’;
+    std::cout <<"sizeof(EmptyToo): " << sizeof(EmptyToo) <<’\n’;
+    std::cout <<"sizeof(NonEmpty): " << sizeof(NonEmpty) <<’\n’;
+}
+```
+
+NonEmpty不再是一个空类，其内存布局如下所示：
+
+![EBCO](..\image\template\EBCO.png)
+
+这样子，可以通过两个指针保证所指向的对象不是同一个对象。
+
+EBCO有什么作用呢，考虑下面的例子：
+
+```c++
+template<typename T1, typename T2>
+class MyClass {
+private:
+    T1 a;
+    T2 b;
+    …
+};
+```
+
+其中的模板参数完全可能被空class类型替换，这样会浪费一个字的内存，这一内存浪费可以通过把模板参数当作基类来避免：
+
+```c++
+template<typename T1, typename T2>
+class MyClass : private T1, private T2 {
+};
+```
+
+然而这样也有缺点：
+
+- 当T1或T2被一个非class类型或者union类型替换时，该方法不再适用；
+- 当两个模板参数被同一种类型替换的时候，该方法不再适用；
+- 用来替换T1或者T2的类型可能是final的，此时尝试派生出新类可能会触发错误；
+
+当已知模板参数只会被class类型替换，以及需要支持另一个模板参数时候，可以使用另一种方法，那就是使用EBCO将可能为空的类型参数与别的参数合并，比如：
+
+```c++
+template<typename CustomClass>
+class Optimizable {
+private:
+	BaseMemberPair<CustomClass, void*> info_and_storage; …
+};
+
+#ifndef BASE_MEMBER_PAIR_HPP
+#define BASE_MEMBER_PAIR_HPP
+template<typename Base, typename Member>
+class BaseMemberPair : private Base {
+private:
+	Member mem;
+public:// constructor
+    BaseMemberPair (Base const & b, Member const & m)
+    : Base(b), mem(m) {
+    }
+    // access base class data via first()
+    Base const& base() const {
+    	return static_cast<Base const&>(*this);
+    }
+    Base& base() {
+    	return static_cast<Base&>(*this);
+    }
+    // access member data via second()
+    Member const& member() const {
+    	return this->mem;
+    }
+    Member& member() {
+    	return this->mem;
+    }
+};
+#endif // BASE_MEMBER_PAIR_HPP
+```
+
+当Base是一个空基类时，显然得到了优化。
+
+### The Curiously Recurring Template Pattern(CRTP)
+
+将派生类作为模板参数传递给其某个基类的一项技术，最简单的实现如下：
+
+```c++
+template<typename Derived>
+class CuriousBase { …
+};
+class Curious : public CuriousBase<Curious> { …
+};
+
+```
+
+这个例子中使用了非依赖性基类，Curious并不是一个模板类，因此它对在依赖性基类中遇到的名称可见性问题是免疫的。事实上，我们同样可以使用以下的方式：
+
+```c++
+template<typename Derived>
+class CuriousBase { 
+	…
+};
+template<typename T>
+class CuriousTemplate : public CuriousBase<CuriousTemplate<T>> { 
+    …
+};
+```
+
+将派生类通过模板参数传递给基类，基类可以在不使用虚函数的情况下定制派生类的行为，这使得CRTP对那些只能被实现为成员函数的情况或者依赖于派生类的特性的情况很有帮助。
+
+一个CRTP的简单应用是追踪一个class类型实例化出了多少对象：
+
+```c++
+#include <cstddef>
+template<typename CountedType>
+class ObjectCounter {
+private:
+	inline static std::size_t count = 0; // number of existing objects
+protected:
+    // default constructor
+    ObjectCounter() {
+        ++count;
+    }
+    // copy constructor
+    ObjectCounter (ObjectCounter<CountedType> const&) {
+        ++count;
+    }
+    // move constructor
+    ObjectCounter (ObjectCounter<CountedType> &&) {
+        ++count;
+    }
+    // destructor
+    ~ObjectCounter() {
+        --count;
+    }	
+public:
+    // return number of existing objects:
+    static std::size_t live() {
+    	return count;
+    }
+};
+```
+
+为了在类内部初始化count成员使用了inline，在17之前必须在类模板外面定义它。
+
+下面介绍The Barton-Nackman Trick，假设现在有一个需要定义operator==的类模板Array，一个可能的方案是将该运算符定义为类模板的成员，但由于第一个参数是this，第二个参数是Array类型，我们肯定希望该运算符的参数是对称的，因此选择将其定义为命名空间的函数：
+
+```c++
+template<typename T>
+class Array {
+public: …
+};
+template<typename T>bool operator== (Array<T> const& a, Array<T> const&
+b)
+{
+    …
+}
+```
+
+这带来的一个问题是函数模板不能重载，则当前作用域不能再声明其他的operator==模板，为了解决这个问题，Barton和Nackman通过将operator==定义为class内部的一个常规友元函数解决了这个问题：
+
+```c++
+template<typename T>
+class Array {
+static bool areEqual(Array<T> const& a, Array<T> const& b);
+public: …
+    friend bool operator== (Array<T> const& a, Array<T> const& b)
+    {
+    	return areEqual(a, b);
+    }
+};
+```
+
+由于operator==会被隐式的当作inline函数，因此这里委托了一个静态成员函数，这样就不必每个类都需要保存一个operator==函数指针。
+
+然而从94年开始，如果要查找友元函数，意味着在函数的调用参数中，至少要有一个参数包含了friend函数的关联类，这意味着这种方法不那么有效了。
+
+运算符的实现，可以通过模板将其泛型化：
+
+```c++
+template<typename T>
+bool operator!= (T const& x1, T const& x2) {
+	return !(x1 == x2);
+}
+```
+
+事实上，在标准库\<utility\>头文件中已经包含了类似的定义，但是一些别的定义（如!=，>，<=等）在标准化的过程中被放到了namespace std::rel_ops中。使用这些其实有个问题，那就是相比于用于定义的需要从派生类到基类转换的!=operator，通用的!=operator总是被优先选择，这有时会导致意料之外的结果。另一种基于CRTP的运算符模板形式，则允许程序去选择泛型的运算符定义：
+
+```c++
+template<typename Derived>
+class EqualityComparable
+{
+public:
+    friend bool operator!= (Derived const& x1, Derived const& x2)
+    {
+    	return !(x1 == x2);
+    }
+};
+class X : public EqualityComparable<X>
+{
+public:
+    friend bool operator== (X const& x1, X const& x2) {
+    // implement logic for comparing two objects of type X
+    }
+};
+int main()
+{
+    X x1, x2;
+    if (x1 != x2) { }
+}
+```
+
+这样就将一部分行为分解到了基类，同时保存了派生类的标识，这使得可以基于一些简单的运算符为大量的运算符提供统一的定义。
+
+我们可以根据上述的定义容易的定义一个指向简单链表的迭代器：
+
+```c++
+template<typename T>
+class ListNode
+{
+public:
+    T value;
+    ListNode<T>* next = nullpt；
+    ~ListNode() { delete next; }
+};
+
+template<typename T>
+class ListNodeIterator
+: public IteratorFacade<ListNodeIterator<T>, T,
+std::forward_iterator_tag>
+{
+	ListNode<T>* current = nullptr;
+public:
+    T& dereference() const {
+    	return current->value;
+    }
+    void increment() {
+    	current = current->next;
+    }
+    bool equals(ListNodeIterator const& other) const {
+    	return current == other.current;
+    }
+    ListNodeIterator(ListNode<T>* current = nullptr) :
+    current(current) { }
+};
+```
+
+上述代码的缺点是，需要将dereference、advance等暴露成public接口，为了避免这一缺点，可以重写IteratorFacade，通过一个单独的访问类来执行所有作用于CRTP派生类的运算符操作：
+
+```c++
+// ‘friend’ this class to allow IteratorFacade access to core iterator operations:
+class IteratorFacadeAccess
+{
+    // only IteratorFacade can use these definitions
+    template<typename Derived, typename Value, typename Category,
+    typename Reference, 
+    friend class IteratorFacade;
+    // required of all iterators:
+    template<typename Reference, typename Iterator>
+    static Reference dereference(Iterator const& i) {
+    	return i.dereference();
+    }…
+    // required of bidirectional iterators:
+    template<typename Iterator>
+    static void decrement(Iterator& i) {
+    	return i.decrement();
+    }
+    // required of random-access iterators:
+    template<typename Iterator, typename Distance>
+    static void advance(Iterator& i, Distance n) {
+    	return i.advance(n);
+    }…
+};
+```
+
+除此之外，还可以基于这种迭代器创造迭代器的适配器，可将底层迭代器投射到一些指向数据成员的指针，比如：
+
+```c++
+template<typename Iterator, typename T>
+class ProjectionIterator
+: public IteratorFacade<ProjectionIterator<Iterator, T>, T, typename
+std::iterator_traits<Iterator>::iterator_category, T&, typename
+std::iterator_traits<Iterator>::difference_type>
+{
+    using Base = typename std::iterator_traits<Iterator>::value_type;
+    using Distance = typename std::iterator_traits<Iterator>::difference_type;
+    Iterator iter;
+    T Base::* member;
+    friend class IteratorFacadeAccess 
+    …
+    //implement core iterator operations for IteratorFacade
+public:
+    ProjectionIterator(Iterator iter, T Base::* member)
+        : iter(iter), member(member) { }
+    T& dereference() const {
+    	return (*iter).*member;
+    }
+
+};
+template<typename Iterator, typename Base, typename T>
+auto project(Iterator iter, T Base::* member) {
+	return ProjectionIterator<Iterator, T>(iter, member);
+}
+
+#include <vector>
+#include <algorithm>
+#include <iterator>
+int main()
+{
+    std::vector<Person> authors = { {"David", "Vandevoorde"},
+    {"Nicolai", "Josuttis"},
+    {"Douglas", "Gregor"} };
+    std::copy(project(authors.begin(), &Person::firstName),
+    project(authors.end(), &Person::firstName),
+    std::ostream_iterator<std::string>(std::cout, "\n"));
+}
+```
+
+### Mixins（混合）
+
+一般来说，我们可以通过继承来客制化一个类型的行为，这里介绍一种新的方法，Mixins，可以客制化一个类型的行为但是不需要从其进行继承，事实上，Mixins反转了常规的继承方向，因为新的类型被作为类模板的基类混合进了继承层级中，而不是被创建为一个新的派生类。这一方式允许在引入新的数据成员以及某些操作的时候不需要复制相关接口。一个支持mixins的类模板通常会接受一组任意数量的class，从之进行派生：
+
+```c++
+template<typename… Mixins>
+class Point : public Mixins…
+{
+public:
+    double x, y;
+    Point() : Mixins()…, x(0.0), y(0.0) { }
+    Point(double x, double y) : Mixins()…, x(x), y(y) { }
+};
+
+class Label
+{
+public:
+    std::string label;
+    Label() : label("") { }
+};
+using LabeledPoint = Point<Label>;
+```
+
+当和CRTP一起使用的时候，Mixins会更加强大，每一个mixins都是一个以派生类为模板参数的类模板，这样允许对派生类做额外的客制化：
+
+```c++
+template<template<typename>… Mixins>
+class Point : public Mixins<Point>…
+{
+public:
+    double x, y;
+    Point() : Mixins<Point>()…, x(0.0), y(0.0) { }
+    Point(double x, double y) : Mixins<Point>()…, x(x), y(y) { }
+};
+```
+
+Minxins还允许间接的参数化派生类的其他特性，比如成员函数的虚拟性：
+
+```c++
+#include <iostream>
+class NotVirtual {
+};
+class Virtual {
+public:
+	virtual void foo() {
+	}
+};
+template<typename… Mixins>
+class Base : public Mixins…
+{
+public：
+    // the virtuality of foo() depends on its declaration
+    // (if any) in the base classes Mixins…
+    void foo() {
+    	std::cout << "Base::foo()" << ’\n’;
+    }
+};
+template<typename… Mixins>
+class Derived : public Base<Mixins…> {
+public:
+    void foo() {
+    	std::cout << "Derived::foo()" << ’\n’;
+    }
+};
+int main()
+{
+    Base<NotVirtual>* p1 = new Derived<NotVirtual>;
+    p1->foo(); // calls Base::foo()
+    Base<Virtual>* p2 = new Derived<Virtual>;
+    p2->foo(); // calls Derived::foo()
+}
+```
+
+该技术提供了这样一种工具，使用它可以设计出一个既可以用来实例化具体的类，也可以通过继承对其进行扩展的类模板。
+
+### Named Template Arguments（命名的模板参数）
+
+此项技术主要为了解决默认参数可能过多，当指定某个参数时需要同时指定此参数之前的非默认参数。技术方案是将默认类型放在一个基类中，然后通过派生将其重载，相比直接指定类型参数，我们会通过辅助类提供相关信息：
+
+```c++
+template<typename PolicySetter1 = DefaultPolicyArgs,
+typename PolicySetter2 = DefaultPolicyArgs,
+typename PolicySetter3 = DefaultPolicyArgs,
+typename PolicySetter4 = DefaultPolicyArgs>
+class BreadSlicer {
+    using Policies = PolicySelector<PolicySetter1,
+    PolicySetter2,
+    PolicySetter3,
+    PolicySetter4>;
+    // use Policies::P1, Policies::P2, … to refer to the various policies …
+};
+
+// PolicySelector<A,B,C,D> creates A,B,C,D as base classes
+// Discriminator<> allows having even the same base class more than once
+template<typename Base, int D>
+class Discriminator : public Base {
+};
+template<typename Setter1, typename Setter2,
+typename Setter3, typename Setter4>
+class PolicySelector : public Discriminator<Setter1,1>,
+public Discriminator<Setter2,2>,
+public Discriminator<Setter3,3>,
+public Discriminator<Setter4,4>
+{
+};
+```
+
