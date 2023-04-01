@@ -5761,5 +5761,346 @@ public Discriminator<Setter3,3>,
 public Discriminator<Setter4,4>
 {
 };
+
+// name default policies as P1, P2, P3, P4
+class DefaultPolicies {
+public:
+    using P1 = DefaultPolicy1;
+    using P2 = DefaultPolicy2;
+    using P3 = DefaultPolicy3;
+    using P4 = DefaultPolicy4;
+};
+
+// class to define a use of the default policy values
+// avoids ambiguities if we derive from DefaultPolicies more than once
+class DefaultPolicyArgs : virtual public DefaultPolicies {
+};
+
+template<typename Policy>
+class Policy1_is : virtual public DefaultPolicies {
+public:
+	using P1 = Policy; // overriding type alias
+};
+template<typename Policy>
+class Policy2_is : virtual public DefaultPolicies {
+public:
+	using P2 = Policy; // overriding type alias
+};
+template<typename Policy>
+class Policy3_is : virtual public DefaultPolicies {
+public:
+	using P3 = Policy; // overriding type alias
+};
+template<typename Policy>
+class Policy4_is : virtual public DefaultPolicies {
+public:
+	using P4 = Policy; // overriding type alias};
+}
+
+template<…>
+class BreadSlicer { …
+public:
+    void print () {
+    	Policies::P3::doPrint();
+    } …
+};
 ```
 
+## 桥接static和dynamic多态
+
+### 广义函数指针
+
+std::functional<>是一种高效的、广义形式的C++函数指针，提供了与函数指针相同的基本操作：
+
+- 在调用者对函数一无所知的情况下可以被用来调用该函数；
+- 可以被拷贝、move以及赋值；
+- 可以被另一个（函数签名一致）函数初始化或赋值；
+- 如何没有函数与之绑定，状态为null；
+
+与函数指针优点更在于其可以被用来存储lambda以及其他任意实现了合适的operator()的函数对象。
+
+下面来构造一个FunctionPtr来模仿std::functional<>：
+
+```
+// primary template:
+template<typename Signature>
+class FunctionPtr;
+// partial specialization:
+template<typename R, typename… Args>
+class FunctionPtr<R(Args…)>
+{
+private:
+	FunctorBridge<R, Args…>* bridge;
+public:
+    // constructors:
+    FunctionPtr() : bridge(nullptr) {
+    }
+    FunctionPtr(FunctionPtr const& other); // see
+    functionptrcpinv.hpp
+    FunctionPtr(FunctionPtr& other)
+    : FunctionPtr(static_cast<FunctionPtr const&>(other)) {
+    }
+    FunctionPtr(FunctionPtr&& other) : bridge(other.bridge) {
+    	other.bridge = nullptr;
+    }
+    //construction from arbitrary function objects:
+    template<typename F> FunctionPtr(F&& f); // see
+    functionptrinit.hpp// assignment operators:
+    FunctionPtr& operator=(FunctionPtr const& other) {
+        FunctionPtr tmp(other);
+        swap(*this, tmp);
+        return *this;
+    }
+    FunctionPtr& operator=(FunctionPtr&& other) {
+        delete bridge;
+        bridge = other.bridge;
+        other.bridge = nullptr;
+        return *this;
+    }
+    //construction and assignment from arbitrary function objects:
+    template<typename F> FunctionPtr& operator=(F&& f) {
+        FunctionPtr tmp(std::forward<F>(f));
+        swap(*this, tmp);
+        return *this;
+    }
+    // destructor:
+    ~FunctionPtr() {
+    	delete bridge;
+    }
+    friend void swap(FunctionPtr& fp1, FunctionPtr& fp2) {
+    	std::swap(fp1.bridge, fp2.bridge);
+    }
+    explicit operator bool() const {
+    return bridge == nullptr;
+    }
+    // invocation:
+    R operator()(Args… args) const; // see functionptr-cpinv.hpp
+};
+```
+
+### 桥接接口
+
+FunctorBridge类模板负责持有以及维护底层函数对象，其被实现为一个抽象基类，为FunctionPtr的动态多态打下基础：
+
+```c++
+template<typename R, typename… Args>
+class FunctorBridge
+{
+public:
+    virtual ~FunctorBridge() {
+    }
+    virtual FunctorBridge* clone() const = 0;
+    virtual R invoke(Args… args) const = 0;
+};
+```
+
+其提供了一些必要操作：一个析构函数，一个用来copy的clone函数，一个用来调用底层函数对象的invoke操作。有了这些虚函数就可以继续实现FunctionPtr的拷贝构造和函数调用操作符：
+
+```c++
+template<typename R, typename… Args>
+FunctionPtr<R(Args…)>::FunctionPtr(FunctionPtr const& other)
+: bridge(nullptr)
+{
+    if (other.bridge) {
+        bridge = other.bridge->clone();
+    }
+}
+template<typename R, typename… Args>
+R FunctionPtr<R(Args…)>::operator()(Args&&… args) const
+{
+	return bridge->invoke(std::forward<Args>(args)…);
+}
+```
+
+### 类型擦除
+
+FunctorBridge每一个实例都是一个抽象类，为了支持所有可能的函数对象，我们可能需要无限多个派生类，幸运的是，我们可以通过用其所存储的函数对象的类型对派生类进行参数化：
+
+```c++
+template<typename Functor, typename R, typename… Args>
+class SpecificFunctorBridge : public FunctorBridge<R, Args…> {
+Functor functor;
+public:
+    template<typename FunctorFwd>
+    SpecificFunctorBridge(FunctorFwd&& functor)
+    : functor(std::forward<FunctorFwd>(functor)) {
+    }
+    virtual SpecificFunctorBridge* clone() const override {
+   		return new SpecificFunctorBridge(functor);
+    }
+    virtual R invoke(Args&&… args) const override {
+    	return functor(std::forward<Args>(args)…);
+    }
+};
+```
+
+SpecificFunctorBridge实例会在FunctionPtr被实例化的时候顺带产生，其剩余实现如下：
+
+```c++
+template<typename R, typename… Args>
+template<typename F>
+FunctionPtr<R(Args…)>::FunctionPtr(F&& f)
+: bridge(nullptr)
+{
+    using Functor = std::decay_t<F>;
+    using Bridge = SpecificFunctorBridge<Functor, R, Args…>;
+    bridge = new Bridge(std::forward<F>(f));
+}
+```
+
+一旦新开辟的Bridge实例被赋值给数据成员bridge，由于从派生类到基类的转换（Bridge*->FunctorBridge\<R, Args...\>\*），特定类型F的额外信息将会丢失，这样我们可不管具体的类型，统一到基类进行处理。该实现的一个特点是在生成Functor的类型的时候使用了std::decay，使得被推断出来的类型F可以被存储，比如它会将指向函数类型的引用decay成函数指针类型，并移除顶层const，volatile和引用。
+
+### 可选桥接
+
+加入以下功能：检测两个FunctionPtr对象是否会调用相同的函数，为了实现这一功能，在SpecificFunctorBridge加入equals操作：
+
+```c++
+virtual bool equals(FunctorBridge<R, Args…> const* fb) const override
+{
+    if (auto specFb = dynamic_cast<SpecificFunctorBridge const*> (fb))
+    {
+    	return functor == specFb->functor;
+    }
+    //functors with different types are never equal:
+    return false;
+}
+```
+
+最后为FunctionPtr实现operator==：
+
+```c++
+friend bool
+operator==(FunctionPtr const& f1, FunctionPtr const& f2) {
+    if (!f1 || !f2) {
+    	return !f1 && !f2;
+    }
+    return f1.bridge->equals(f2.bridge);
+}
+friend bool
+operator!=(FunctionPtr const& f1, FunctionPtr const& f2) {
+	return !(f1 == f2);
+}
+```
+
+这种实现也有一个缺点：如果FunctionPtr被一个没有实现合适的Operator==的函数对象（比如lambda）赋值，或者被这一类对象初始化，那么会遇到编译错误，这一问题是由于类型擦除导致的：因为在给FunctionPtr赋值或初始化的时候会丢失函数对象的类型信息，该信息就包含调用函数对象的operator==所需要的信息，幸运的是我们可以使用基于SFINAE的萃取技术，在调用operator==之前确认是否可用：
+
+```c++
+#include <utility> // for declval()
+#include <type_traits> // for true_type and false_type
+template<typename T>
+class IsEqualityComparable
+{
+private:
+    // test convertibility of == and ! == to bool:
+    static void* conv(bool); // to check convertibility to bool
+    template<typename U>
+    static std::true_type test(decltype(conv(std::declval<U
+    const&>() == std::declval<U const&>())),
+    decltype(conv(!(std::declval<U const&>() == std::declval<U
+    const&>()))));
+    // fallback:
+    template<typename U>
+    static std::false_type test(…);
+public:
+    static constexpr bool value = decltype(test<T>(nullptr,
+    nullptr))::value;
+};
+```
+
+两个test重载，一个包含了封装在decltype中用来测试的表达式，另一个通过省略号来接收任意数量的参数，第一个test试图通过==来比较两个T const类型的对象，然后确保两个结果可以被隐式的转换成bool，并将可以转换为bool的结果传递给operator!=，如果两个运算符都正常，参数类型将是void*。
+
+使用IsEqualityComparable可以构建一个TryEquals类模板，要么会调用==运算符，要么在没有可用的时候抛出异常：
+
+```c++
+#include <exception>
+#include "isequalitycomparable.hpp"
+template<typename T, bool EqComparable =
+IsEqualityComparable<T>::value>
+struct TryEquals
+{
+    static bool equals(T const& x1, T const& x2) {
+    	return x1 == x2;
+    }
+};
+class NotEqualityComparable : public std::exception
+{ };
+template<typename T>
+struct TryEquals<T, false>
+{
+    static bool equals(T const& x1, T const& x2) {
+    	throw NotEqualityComparable();
+    }
+}
+
+virtual bool equals(FunctorBridge<R, Args…> const* fb) const override
+{
+    if (auto specFb = dynamic_cast<SpecificFunctorBridge const*>(fb)) {
+   		return TryEquals<Functor>::equals(functor, specFb->functor);
+    }
+    //functors with different types are never equal:
+    return false;
+}
+```
+
+## 元编程
+
+元编程的特性之一就是在编译期间就可以进行一部分用户定义的计算。
+
+元编程分为值元编程，类型元编程。类型元编程，比如考虑以下的例子：
+
+```c++
+// primary template: in general we yield the given type:
+template<typename T>
+struct RemoveAllExtentsT {
+	using Type = T;
+};
+// partial specializations for array types (with and without bounds):
+template<typename T, std::size_t SZ>
+struct RemoveAllExtentsT<T[SZ]> {
+	using Type = typename RemoveAllExtentsT<T>::Type;
+};
+template<typename T>
+struct RemoveAllExtentsT<T[]> {
+	using Type = typename RemoveAllExtentsT<T>::Type;
+};
+template<typename T>
+using RemoveAllExtents = typename RemoveAllExtentsT<T>::Type;
+```
+
+这里的RemoveAllExtents就是一种类型元函数，它会从类型中移除任意数量的顶层数组层：
+
+```c++
+RemoveAllExtents<int[]> // yields int
+RemoveAllExtents<int[5][10]> // yields int
+RemoveAllExtents<int[][10]> // yields int
+RemoveAllExtents<int(*)[5]> // yields int(*)[5]
+```
+
+元函数通过偏特化来匹配高层次的数组，递归的调用自己并最终完成任务。
+
+通过使用数值元编程和类型元编程，可以在编译期间计算数值和类型，不过元编程能做的不仅仅只有这些：我们可以在编译期间，以编程的方式组合一些有运行期效果的代码，称之为混合元编程。比如两个array的相乘：
+
+```c++
+template<typename T, std::size_t N>
+struct DotProductT {
+    static inline T result(T* a, T* b)
+    {
+    	return *a * *b + DotProduct<T, N-1>::result(a+1,b+1);
+    }
+};
+// partial specialization as end criteria
+template<typename T>
+struct DotProductT<T, 0> {
+    static inline T result(T*, T*) {
+    	return T{};
+    }
+};
+template<typename T, std::size_t N>
+auto dotProduct(std::array<T, N> const& x,
+std::array<T, N> const& y)
+{
+	return DotProductT<T, N>::result(x.begin(), y.begin());
+}
+```
+
+例子中为了支持偏特化所以用了struct，使用了内联保证递归实例化的效率。
