@@ -6104,3 +6104,1401 @@ std::array<T, N> const& y)
 ```
 
 例子中为了支持偏特化所以用了struct，使用了内联保证递归实例化的效率。
+
+以下是另一个例子，要用一个基于主单位的分数来记录相关单位:
+
+```c++
+template<unsigned N, unsigned D = 1>
+struct Ratio {
+    static constexpr unsigned num = N; // numerator
+    static constexpr unsigned den = D; // denominator
+    using Type = Ratio<num, den>;
+};
+
+// implementation of adding two ratios:
+template<typename R1, typename R2>
+struct RatioAddImpl
+{
+private:
+    static constexpr unsigned den = R1::den * R2::den;
+    static constexpr unsigned num = R1::num * R2::den + R2::num *
+    R1::den;
+public:
+	typedef Ratio<num, den> Type;
+};
+// using declaration for convenient usage:
+template<typename R1, typename R2>
+using RatioAdd = typename RatioAddImpl<R1, R2>::Type;
+
+using R1 = Ratio<1,1000>;
+using R2 = Ratio<2,3>;
+using RS = RatioAdd<R1,R2>; //RS has type Ratio<2003,2000>
+std::cout << RS::num << ’/’ << RS::den << ’\n’; //prints 2003/3000
+using RA = RatioAdd<Ratio<2,3>,Ratio<5,7>>; //RA has type
+Ratio<29,21>
+std::cout << RA::num << ’/’ << RA::den << ’\n’; //prints 29/2
+
+// duration type for values of type T with unit type U:
+template<typename T, typename U = Ratio<1>>
+class Duration {public:
+    using ValueType = T;
+    using UnitType = typename U::Type;
+    private:
+    ValueType val;
+public:
+    constexpr Duration(ValueType v = 0)
+    : val(v) {
+    }
+    constexpr ValueType value() const {
+    	return val;
+    }
+};
+
+// adding two durations where unit type might differ:
+template<typename T1, typename U1, typename T2, typename U2>
+auto constexpr operator+(Duration<T1, U1> const& lhs,
+Duration<T2, U2> const& rhs)
+{
+    // resulting type is a unit with 1 a nominator and
+    // the resulting denominator of adding both unit type fractions
+    using VT = Ratio<1,RatioAdd<U1,U2>::den>;
+    // resulting value is the sum of both values
+    // converted to the resulting unit type:
+    auto val = lhs.value() * VT::den / U1::den * U1::num +
+    rhs.value() * VT::den / U2::den * U2::num;
+    return Duration<decltype(val), VT>(val);
+}
+
+int x = 42;
+int y = 77;
+auto a = Duration<int, Ratio<1,1000>>(x); // x milliseconds
+auto b = Duration<int, Ratio<2,3>>(y); // y 2/3 seconds
+auto c = a + b; //computes resulting unit type 1/3000 seconds//and
+generates run-time code for c = a*3 + b*2000
+```
+
+其中Ratio类表示分数，num和den分别表示分子和分母。
+
+### 反射元编程的维度
+
+值元编程除了constexpr函数之外，还可以使用跟类型元编程相似的递归实例化：
+
+```c++
+// primary template to compute sqrt(N)
+template<int N, int LO=1, int HI=N>
+struct Sqrt {
+    // compute the midpoint, rounded up
+    static constexpr auto mid = (LO+HI+1)/2;
+    // search a not too large value in a halved interval
+    static constexpr auto value = (N<mid*mid) ?
+    Sqrt<N,LO,mid-1>::value : Sqrt<N,mid,HI>::value;
+};
+// partial specialization for the case when LO equals HI
+template<int N, int M>
+struct Sqrt<N,M,M> {
+	static constexpr auto value = M;
+};
+```
+
+这段代码中使用了static，其生命周期在编译期可以确定，编译器可以在编译期对这些变量进行计算和优化。这段代码的效率远不如constexpt函数友好。一个综合的元编程解决方案应该在以下三个维度中选择：
+
+- 计算维度；
+- 反射维度；
+- 生成维度；
+
+反射维度是以编程方式检测程序特性的能力，生成维度指为程序生成额外代码的能力。计算维度中我们已经认识了递归实例化和constexpr计算，对于反射维度，类型萃取一章中也介绍了部分方案。
+
+### 递归实例化的代价
+
+比如原先的sqrt模板，有这样的代码：
+
+```c++
+(16<=8*8) ? Sqrt<16,1,8>::value
+: Sqrt<16,9,16>::value
+```
+
+它并不是只计算真正用到了的分支，同样也会计算没有用到的分支，不止如此，代码试图访问实例化来的类的成员，所以该类中所有的成员都会被实例化，最终实例化出的实例几乎是N的两倍。幸运的是，有一些技术可以被用来降低实例化的数目，比如：
+
+```c++
+#include "ifthenelse.hpp"
+// primary template for main recursive step
+template<int N, int LO=1, int HI=N>
+struct Sqrt {
+    // compute the midpoint, rounded up
+    static constexpr auto mid = (LO+HI+1)/2;
+    // search a not too large value in a halved interval
+    using SubT = IfThenElse<(N<mid*mid),
+    Sqrt<N,LO,mid-1>,
+    Sqrt<N,mid,HI>>;
+    static constexpr auto value = SubT::value;
+};
+// partial specialization for end of recursion criterion
+template<int N, int S>
+struct Sqrt<N, S, S> {
+	static constexpr auto value = S;
+};
+```
+
+这里比较重要的一点是为一个类模板的实例定义类型别名，不会导致编译期去实例化该实例，在调用SubT::value的时候，只有真正被赋值给SubT的那一个实例才会被完全实例化。
+
+### 计算完整性
+
+从Sqrt的例子可以看出，一个模板元程序可能包括以下内容：
+
+- 状态变量：模板参数；
+- 循环结构：通过递归实现；
+- 执行路径选择：通过条件表达式或者偏特例化实现；
+- 整数运算；
+
+### 递归实例化和递归模板参数
+
+考虑以下递归模板：
+
+```c++
+template<typename T, typename U>
+struct Doublify {
+};
+template<int N>
+struct Trouble {
+    using LongType = Doublify<typename Trouble<N-1>::LongType,
+    typename Trouble<N-1>::LongType>;
+};
+template<>
+struct Trouble<0> {
+	using LongType = double;
+};
+Trouble<10>::LongType ouch;
+```
+
+其会越来越复杂的类型实例化Doublify，比如：
+
+![Doublify](..\image\template\Doublify.png)
+
+这样看来Trouble\<N\>::LongType类型的复杂度与N成指数关系，通常这种情况给编译器的压力要比有递归实例化但是没有递归模板参数的情况要大，这里的问题在于编译器会用一些支离破碎的名字来表达这些类型，这些支离破碎的名字会用相同的方式去编码模板的实例化，在早期c++中，这一编码方式的实现和模板签名的长度成正比。新的C++实现使用聪明的压缩技术来降低名称编码，但除此之外其他情况没有改善，因此在组织递归实例化代码的时候最好不要让模板参数也嵌套递归。
+
+### 枚举值还是静态常量
+
+在早期C++中枚举值是唯一可以在类的声明中创建可用于类成员的真正的常量（常量表达式）的方式，比如：
+
+```c++
+// primary template to compute 3 to the Nth
+template<int N>
+struct Pow3 {
+	enum { value = 3 * Pow3<N-1>::value };
+};
+// full specialization to end the recursion
+template<>
+struct Pow3<0> {
+	enum { value = 1 };
+};
+
+```
+
+在98中引入了类内静态常量初始化的概念，因此上面代码可以改写为：
+
+```c++
+// primary template to compute 3 to the Nth
+template<int N
+struct Pow3 {
+	static int const value = 3 * Pow3<N-1>::value;
+};
+// full specialization to end the recursion
+template<>
+struct Pow3<0> {
+	static int const value = 1;
+};
+```
+
+但这样有一个问题，静态常量成员是左值，因此如果有这种情况：
+
+```c++
+void foo(int const&);
+foo(Pow3<7>::value);
+```
+
+编译器需要传递地址，因此必须实例化静态成员并为之开辟内存，这样就不是一个纯正的编译期程序了。枚举值不是左值（也就是说没有地址），因此将其按引用传递，不会用到静态内存，几乎等效于将计算值按照字面值传递。后来，C++引入了constexpr静态数据成员，其使用不限于整型数据，虽然这没有解决上文中关于地址的问题，即便如此，它也是用来产生元程序结果的常规方法，其优点是它可以有正确的类型（相对于人工的枚举而言），而且用auto声明静态成员类型时，可以对类型进行推断，17引入了inline的静态数据成员，解决了上面提到的地址问题，而且可以和constexpr一起使用。
+
+## 类型列表
+
+对于类型元编程，核心的数据结构是typelist，指的是包含了类型的列表，它提供了典型的列表操作方法：遍历列表中的元素，添加元素或者删除元素。但是它和大多数运行期的数据结构都不同，它的值不允许修改，向类型列表添加一个元素不会修改原始列表，而是会创建一个新的。
+
+类型列表通常是按照类模板特例的形式实现的，它将自身的内容编码到了参数包中。一种直接的实现方式如下：
+
+```c++
+template<typename… Elements>
+class Typelist
+{};
+```
+
+下面是一个包含了所有有符号整型的类型列表：
+
+```c++
+using SignedIntegralTypes =
+Typelist<signed char, short, int, long, long>;
+```
+
+操作这个类型列表可能有很多元函数，比如Front：
+
+```c++
+template<typename List>
+class FrontT;
+template<typename Head, typename… Tail>
+class FrontT<Typelist<Head, Tail…>>
+{
+public:
+	using Type = Head;
+};
+template<typename List>
+using Front = typename FrontT<List>::Type;
+```
+
+这里使用了偏特化的实现，只要有类型存在，就会使用特化的模板，如果为空，会使用主模板。
+
+同理也可以向列表中添加元素，只需要将所有存在的元素捕获到一个包中，之后创建一个包含了所有元素的特例即可：
+
+```c++
+template<typename List, typename NewElement>
+class PushFrontT;
+template<typename… Elements, typename NewElement>
+class PushFrontT<Typelist<Elements…>, NewElement> {
+public:
+	using Type = Typelist<NewElement, Elements…>;
+};
+template<typename List, typename NewElement>
+using PushFront = typename PushFrontT<List, NewElement>::Type;
+```
+
+### 类型列表的算法
+
+基础的类型列表操作可以组合起来实现更有意思的列表操作，比如将PushFront作用于PopFront可以实现对第一个元素的替换：
+
+```c++
+using Type = PushFront<PopFront<SignedIntegralTypes>, bool>;
+// equivalent to Typelist<bool, short, int, long, long>
+```
+
+我们实现列表比较基础的操作，索引，比如提取第N个元素，其实现方式是使用一个递归的元程序遍历typelist的元素，直到找到所需的：
+
+```c++
+// recursive case:
+template<typename List, unsigned N>
+class NthElementT : public NthElementT<PopFront<List>, N-1>
+{};
+// basis case:
+template<typename List>
+class NthElementT<List, 0> : public FrontT<List>
+{ };
+template<typename List, unsigned N>
+using NthElement = typename NthElementT<List, N>::Type;
+```
+
+先看基本情况，对FrontT\<List\>进行public继承，这样其可以使用Type类型成员，偏特化部分用来遍历成员。
+
+有些类型列表算法会想要查找列表中的数据，比如找出列表中最大的类型，同样可以通过递归模板元程序实现：
+
+```c++
+template<typename List>
+class LargestTypeT;
+// recursive case:
+template<typename List>
+class LargestTypeT
+{
+private:
+    using First = Front<List>;
+    using Rest = typename LargestTypeT<PopFront<List>>::Type;
+public:
+    using Type = IfThenElse<(sizeof(First) >= sizeof(Rest)), First,
+    Rest>;
+};
+// basis case:
+template<>
+class LargestTypeT<Typelist<>>
+{
+public:
+	using Type = char;
+};
+template<typename List>
+using LargestType = typename LargestTypeT<List>::Type;
+```
+
+代码中显式的用到了空的类型列表Typelist<>，这样有点不太好，因为它可能会妨碍到其他类型的类型列表，为了解决这一问题，引入了IsEmpty元函数，可以用来判断一个类型列表是否为空：
+
+```c++
+template<typename List>
+class IsEmpty
+{
+public:
+	static constexpr bool value = false;
+};
+template<>
+class IsEmpty<Typelist<>> {
+public:
+	static constexpr bool value = true;
+};
+
+template<typename List, bool Empty = IsEmpty<List>::value>
+class LargestTypeT;
+// recursive case:
+template<typename List>
+class LargestTypeT<List, false>
+{
+private:
+    using Contender = Front<List>;
+    using Best = typename LargestTypeT<PopFront<List>>::Type;
+public:
+    using Type = IfThenElse<(sizeof(Contender) >=
+    sizeof(Best)),Contender, Best>;
+};
+// basis case:
+template<typename List>
+class LargestTypeT<List, true>
+{
+public:
+	using Type = char;
+};
+template<typename List>
+using LargestType = typename LargestTypeT<List>::Type;
+```
+
+为了支持列表的PushBack，需要对PushFront做一点小修改：
+
+```c++
+template<typename List, typename NewElement>
+class PushBackT;
+template<typename… Elements, typename NewElement>
+class PushBackT<Typelist<Elements…>, NewElement>
+{
+public:
+	using Type = Typelist<Elements…, NewElement>;
+};
+template<typename List, typename NewElement>
+using PushBack = typename PushBackT<List, NewElement>::Type;
+
+template<typename List, typename NewElement, bool =
+IsEmpty<List>::value>
+class PushBackRecT;
+// recursive case:
+template<typename List, typename NewElement>
+class PushBackRecT<List, NewElement, false>
+{
+    using Head = Front<List>;
+    using Tail = PopFront<List>;
+    using NewTail = typename PushBackRecT<Tail, NewElement>::Type;
+public:
+	using Type = PushFront<Head, NewTail>;
+};
+// basis case:
+template<typename List, typename NewElement>
+class PushBackRecT<List, NewElement, true>
+{
+public:
+	using Type = PushFront<List, NewElement>;
+};
+// generic push-back operation:
+template<typename List, typename NewElement>
+class PushBackT : public PushBackRecT<List, NewElement> { };
+template<typename List, typename NewElement>
+using PushBack = typename PushBackT<List, NewElement>::Type;
+```
+
+下面介绍列表的反转：
+
+```c++
+template<typename List, bool Empty = IsEmpty<List>::value>
+class ReverseT;
+template<typename List>
+using Reverse = typename ReverseT<List>::Type;
+// recursive case:
+template<typename List>
+class ReverseT<List, false>:public PushBackT<Reverse<PopFront<List>>,
+Front<List>> { };
+// basis case:
+template<typename List>
+class ReverseT<List, true>{
+public:
+	using Type = List;
+};
+
+```
+
+结合Reverse，可以实现移除列表中最后一个元素的PopBack:
+
+```c++
+template<typename List>
+class PopBackT {
+public:
+	using Type = Reverse<PopFront<Reverse<List>>>;
+};
+template<typename List>
+using PopBack = typename PopBackT<List>::Type;
+```
+
+该算法先反转整个列表，然后删除首元素并将剩余列表再次反转，从而实现删除末尾元素的目的。
+
+列表类型的转换，为了实现这个目的，相应的算法应该接受一个类型列表和一个元函数作为参数，并返回一个将该元函数作用于类型列表中每个元素之后得到的新的类型列表。算法如下：
+
+```c++
+template<typename List, template<typename T> class MetaFun, bool Empty
+= IsEmpty<List>::value>
+class TransformT;
+// recursive case:
+template<typename List, template<typename T> class MetaFun>
+class TransformT<List, MetaFun, false>
+: public PushFrontT<typename TransformT<PopFront<List>,
+MetaFun>::Type, typename MetaFun<Front<List>>::Type>
+{};
+// basis case:
+template<typename List, template<typename T> class MetaFun>
+class TransformT<List, MetaFun, true>
+{
+public:
+using Type = List;
+};
+template<typename List, template<typename T> class MetaFun>
+using Transform = typename TransformT<List, MetaFun>::Type;
+```
+
+类型列表的累加需要用到转换算法，它会将类型列表中的所有元素组合成一个值，它接受一个包含元素T1、T2、……、TN的类型列表T，一个初始类型I，和一个接收两个类型作为参数的元函数F，并最终返回一个类型。其实现方式遵循了标准的递归元编程模式：
+
+```c++
+template<typename List,
+    template<typename X, typename Y> class F,
+    typename I,
+	bool = IsEmpty<List>::value>
+class AccumulateT;
+// recursive case:
+template<typename List,
+template<typename X, typename Y> class F,
+typename I>
+class AccumulateT<List, F, I, false>
+: public AccumulateT<PopFront<List>, F,
+typename F<I, Front<List>>::Type>
+{};
+// basis case:
+template<typename List,
+template<typename X, typename Y> class F,
+typename I>
+class AccumulateT<List, F, I, true>
+{
+public:
+	using Type = I;
+};
+template<typename List,
+template<typename X, typename Y> class F,
+typename I>
+using Accumulate = typename AccumulateT<List, F, I>::Type;
+```
+
+插入排序，和其他算法类似，其递归过程会将列表分成第一个元素和剩余元素，然后对剩余元素进行递归排序，并将头元素插入到合适的位置，其实现如下：
+
+```c++
+template<typename List, template<typename T, typename U> class Compare,
+bool = IsEmpty<List>::value>
+class InsertionSortT;
+template<typename List, template<typename T, typename U> class Compare>
+using InsertionSort = typename InsertionSortT<List, Compare>::Type;
+// recursive case (insert first element into sorted list):
+template<typename List, template<typename T, typename U> class Compare>
+class InsertionSortT<List, Compare, false>
+: public InsertSortedT<InsertionSort<PopFront<List>, Compare>,
+Front<List>, Compare>
+{};
+// basis case (an empty list is sorted):
+template<typename List, template<typename T, typename U> class Compare>
+class InsertionSortT<List, Compare, true>
+{
+public:
+	using Type = List;
+};
+
+#include "identity.hpp"
+template<typename List, typename Element,
+template<typename T, typename U> class Compare, bool =
+IsEmpty<List>::value>
+class InsertSortedT;
+// recursive case:
+template<typename List, typename Element, template<typename T,
+typename U> class Compare>
+class InsertSortedT<List, Element, Compare, false>
+{
+    // compute the tail of the resulting list:
+    using NewTail = typename IfThenElse<Compare<Element,
+    Front<List>>::value, IdentityT<List>,
+    InsertSortedT<PopFront<List>,
+    Element, Compare>>::Type;
+    // compute the head of the resulting list:
+    using NewHead = IfThenElse<Compare<Element, Front<List>>::value,
+	Element, Front<List>>;
+public:
+	using Type = PushFront<NewTail, NewHead>;
+};
+// basis case:
+template<typename List, typename Element, template<typename T,
+typename U> class Compare>
+class InsertSortedT<List, Element, Compare, true>
+: public PushFrontT<List, Element>
+{};
+template<typename List, typename Element,template<typename T, typename
+U> class Compare>
+using InsertSorted = typename InsertSortedT<List, Element,
+Compare>::Type;
+```
+
+### 非类型列表
+
+有很多种方法可以用来生成一个包含编译期数值的类型列表，一个简单的方法是定义一个类模板CTValue，然后用它表示类型列表中某种类型的值：
+
+```c++
+template<typename T, T Value>
+struct CTValue
+{
+	static constexpr T value = Value;
+};
+
+using Primes = Typelist<CTValue<int, 2>, CTValue<int, 3>,
+    CTValue<int, 5>, CTValue<int, 7>,
+    CTValue<int, 11>>;
+```
+
+这样就可以对列表中的数值进行数值计算，比如这些素数的乘积：
+
+```c++
+template<typename T, typename U>
+struct MultiplyT;
+template<typename T, T Value1, T Value2>
+struct MultiplyT<CTValue<T, Value1>, CTValue<T, Value2>> {
+public:
+	using Type = CTValue<T, Value1 * Value2>;
+};
+template<typename T, typename U>
+using Multiply = typename MultiplyT<T, U>::Type;
+
+Accumulate<Primes, MultiplyT, CTValue<int, 1>>::value
+```
+
+但这样太复杂了，尤其是所有数值的类型相同时，可以引入CTTypelist模板别名来优化，它提供了一组包含在Typelist中、类型相同的数值：
+
+```c++
+template<typename T, T… Values>
+using CTTypelist = Typelist<CTValue<T, Values>...>;
+using Primes = CTTypelist<int, 2, 3, 5, 7, 11>;
+```
+
+这一方式的缺点是别名终归只是别名，当遇到错误时，错误信息可能一直会打印到底层的Typelist，导致错误信息过于冗长，为了解决这一问题，可以定义一个可以直接存储数值的、全新的列表类Valuelist：
+
+```c++
+template<typename T, T… Values>
+struct Valuelist {
+};
+template<typename T, T… Values>
+struct IsEmpty<Valuelist<T, Values…>> {
+	static constexpr bool value = sizeof…(Values) == 0;
+};
+template<typename T, T Head, T… Tail>
+struct FrontT<Valuelist<T, Head, Tail…>> {
+    using Type = CTValue<T, Head>;
+    static constexpr T value = Head;
+};
+template<typename T, T Head, T… Tail>
+struct PopFrontT<Valuelist<T, Head, Tail…>> {
+	using Type = Valuelist<T, Tail…>;
+};
+template<typename T, T… Values, T New>
+struct PushFrontT<Valuelist<T, Values…>, CTValue<T, New>> {
+	using Type = Valuelist<T, New, Values…>;
+};
+template<typename T, T… Values, T New>
+struct PushBackT<Valuelist<T, Values…>, CTValue<T, New>> {
+	using Type = Valuelist<T, Values…, New>;
+};
+```
+
+在17中，可以通过一个可推断的非类型参数（结合auto）来优化CTValue的实现：
+
+```c++
+template<auto Value>
+struct CTValue
+{
+	static constexpr auto value = Value;
+};
+using Primes = Typelist<CTValue<2>, CTValue<3>, CTValue<5>, CTValue<7>,
+CTValue<11>>;
+```
+
+### 对包扩展相关算法的优化
+
+通过适用包展开，可以将类型列表迭代的任务转移给编译器，比如：
+
+```c++
+template<typename… Elements, template<typename T> class MetaFun>
+class TransformT<Typelist<Elements…>, MetaFun, false>
+{
+public:
+	using Type = Typelist<typename MetaFun<Elements>::Type…>;
+};
+```
+
+也可以基于索引值从一个已有列表中选择一些元素，并生成新的列表：
+
+```c++
+template<typename Types, typename Indices>
+class SelectT;
+template<typename Types, unsigned… Indices>
+class SelectT<Types, Valuelist<unsigned, Indices…>>
+{
+public:
+	using Type = Typelist<NthElement<Types, Indices>…>;
+};
+template<typename Types, typename Indices>
+using Select = typename SelectT<Types, Indices>::Type;
+```
+
+### Cons-style Typelists
+
+在引入变参模板之前，类型列表通常参照LISP的cons单元的实现方式，用递归数据结构实现，每一个cons单元包含一个值（列表的head）和一个嵌套列表，这个嵌套列表可以是另一个cons单元或者一个空的列表nil，实现如下：
+
+```c++
+class Nil { };
+template<typename HeadT, typename TailT = Nil>
+class Cons {
+public:
+    using Head = HeadT;
+    using Tail = TailT;
+};
+using TwoShort = Cons<short, Cons<unsigned short>>;
+using SignedIntegralTypes = Cons<signed char, Cons<short, Cons<int,
+Cons<long, Cons<long long, Nil>>>>>;
+
+```
+
+向这样一个cons-style列表中提取第一个元素，只需要直接访问其头部元素：
+
+```c++
+template<typename List>
+class FrontT {
+public:
+	using Type = typename List::Head;
+};
+template<typename List>
+using Front = typename FrontT<List>::Type;
+```
+
+向其头部追加一个元素只需要在当前类型列表外包上一层：
+
+```c++
+template<typename List, typename Element>
+class PushFrontT {
+public:
+	using Type = Cons<Element, List>;
+};
+template<typename List, typename Element>
+using PushFront = typename PushFrontT<List, Element>::Type;
+```
+
+要删除首元素，只需要提取出当前列表的Tail即可：
+
+```c++
+template<typename List>
+class PopFrontT {
+public:
+	using Type = typename List::Tail;
+};
+template<typename List>
+using PopFront = typename PopFrontT<List>::Type;
+
+```
+
+至于IsEmpty的实现，只需要对Nil进行特例化：
+
+```c++
+template<typename List>
+struct IsEmpty {
+	static constexpr bool value = false;
+};
+template<>
+struct IsEmpty<Nil> {
+	static constexpr bool value = true;
+};
+```
+
+## 元组
+
+容器包含不同的类型，通过位置信息索引。
+
+类型列表Typelist描述了一组可以在编译期间操作的类型，元组则描述了可以在运行期间操作的存储，比如：
+
+```c++
+template<typename… Types>
+class Tuple { … // implementation discussed below
+};
+Tuple<int, double, std::string> t(17, 3.14, "Hello, World!");
+```
+
+通常会使用模板元编程和typelist来创建存储数据的tuple。
+
+### 基本的元组设计
+
+元组包含了对模板参数列表中每一个类型的存储，这部分存储可以通过函数模板get进行访问，对于元组t，其用法为get\<I\>(t)。比如get\<1\>(t)会返回指向double 3.14的引用。其递归实现是基于这样的思路：一个包含了N个元素的元组可以被存储为一个单独的元素和一个包含了剩余N-1个元素的元组，对于元素为空的元组，只需要当作特例处理即可：
+
+```c++
+template<typename… Types>
+class Tuple;
+// recursive case:
+template<typename Head, typename… Tail>
+class Tuple<Head, Tail…>
+{
+private:
+    Head head;
+    Tuple<Tail…> tail;
+public:
+	// constructors:
+    Tuple() {
+    }
+    Tuple(Head const& head, Tuple<Tail…> const& tail): head(head),
+    tail(tail) {
+    }…
+    Head& getHead() { return head; }
+    Head const& getHead() const { return head; }
+    Tuple<Tail…>& getTail() { return tail; }
+    Tuple<Tail…> const& getTail() const { return tail; }
+};
+// basis case:
+template<>
+class Tuple<> {
+// no storage required
+};
+```
+
+函数模板get则会通过遍历这个递归的结构来提取所需要的元素：
+
+```c++
+// recursive case:
+template<unsigned N>
+struct TupleGet {
+    template<typename Head, typename… Tail>
+    static auto apply(Tuple<Head, Tail…> const& t) {
+    	return TupleGet<N-1>::apply(t.getTail());
+    }
+};
+// basis case:
+template<>
+struct TupleGet<0> {
+    template<typename Head, typename… Tail>
+    static Head const& apply(Tuple<Head, Tail…> const& t) {
+    	return t.getHead();
+    }
+};
+template<unsigned N, typename… Types>
+auto get(Tuple<Types…> const& t) {
+	return TupleGet<N>::apply(t);
+}
+```
+
+这里的get只是封装了一个简单的对TupleGet的静态成员函数的调用，在不能对函数模板进行部分特例化的情况下，这是一个有效的变通方法。
+
+为了让元组的使用更加方便，还应该允许用一组相互独立的值或者另一个元组来构造一个新的元组：
+
+```c++
+Tuple() {
+}
+Tuple(Head const& head, Tuple<Tail…> const& tail)
+: head(head), tail(tail)
+{
+}
+Tuple(Head const& head, Tail const&… tail)
+: head(head), tail(tail…)
+{}
+```
+
+用户可能会希望用移动构造来初始化元组的一些元素，或者用一个类型不相同的数值类初始化元组的某个元素，因此需要用完美转发来初始化元组：
+
+```c++
+template<typename VHead, typename… VTail>
+Tuple(VHead&& vhead, VTail&&… vtail)
+: head(std::forward<VHead>(vhead)), tail(std::forward<VTail>(vtail)…)
+{
+}
+```
+
+下面的实现则允许用一个元组去构建另一个元组：
+
+```c++
+template<typename VHead, typename… VTail>
+Tuple(Tuple<VHead, VTail…> const& other)
+: head(other.getHead()), tail(other.getTail())
+{ }
+```
+
+然而这个构造函数不适用于类型转换：给定上文中的t，试图用它来创建一个元素之间类型兼容的元组会遇到错误：
+
+```c++
+// ERROR: no conversion from Tuple<int, double, string> to long
+Tuple<long int, long double, std::string> t2(t);
+```
+
+这个因为这个调用会更匹配用一组数值去初始化一个元组的构造函数模板，而不是用一个元组去初始化另一个元组的构造函数模板，为了解决这一问题，需要用到6.3节介绍的std::enable_if，在tail长度与预期不同的时候就禁用相关模板：
+
+```c++
+template<typename VHead, typename… VTail, typename = std::enable_if_t<sizeof…
+(VTail)==sizeof… (Tail)>>
+Tuple(VHead&& vhead, VTail&&… vtail)
+: head(std::forward<VHead>(vhead)), tail(std::forward<VTail>(vtail)…)
+{ }
+template<typename VHead, typename… VTail, typename = std::enable_if_t<sizeof…
+(VTail)==sizeof… (Tail)>>
+Tuple(Tuple<VHead, VTail…> const& other)
+: head(other.getHead()), tail(other.getTail()) { }
+```
+
+函数模板会通过类型推断来决定生成元组中元素的类型，这使得用一组数值来创建一个元组变的简单：
+
+```c++
+template<typename… Types>
+auto makeTuple(Types&&… elems)
+{
+	return Tuple<std::decay_t<Types>…>(std::forward<Types> (elems)…);
+}
+```
+
+这里会将字符串常量和裸数组转换成指针，并去除元素的const和引用属性。
+
+### 基础元组操作
+
+例如比较操作：
+
+```c++
+// basis case:
+bool operator==(Tuple<> const&, Tuple<> const&)
+{
+	// empty tuples are always equivalentreturn true;
+}
+// recursive case:
+template<typename Head1, typename… Tail1,
+    typename Head2, typename… Tail2,
+    typename = std::enable_if_t<sizeof…(Tail1)==sizeof…(Tail2)>>
+bool operator==(Tuple<Head1, Tail1…> const& lhs, Tuple<Head2, Tail2…> const& rhs)
+{
+    return lhs.getHead() == rhs.getHead() &&
+    	lhs.getTail() == rhs.getTail();
+}
+
+```
+
+接下来是打印的例子：
+
+```c++
+#include <iostream>
+void printTuple(std::ostream& strm, Tuple<> const&, bool isFirst = true)
+{
+	strm << ( isFirst ? ’(’ : ’)’ );
+}
+template<typename Head, typename… Tail>
+void printTuple(std::ostream& strm, Tuple<Head, Tail…> const& t, bool isFirst =
+true)
+{
+    strm << ( isFirst ? "(" : ", " );
+    strm << t.getHead();
+    printTuple(strm, t.getTail(), false);
+}
+template<typename … Types>
+std::ostream& operator<<(std::ostream& strm, Tuple<Types…> const& t)
+{
+    printTuple(strm, t);
+    return strm;
+}
+```
+
+### 元组的算法
+
+元组是一种提供了以下各种功能的容器：可以访问并修改其元素的能力（通过 get<>），创 建新元组的能力（直接创建或者通过使用 makeTuple<>创建），以及将元组分割成 head 和 tail 的能力（通过使用 getHead()和 getTail()）。使用这些功能足以创建各种各样的元组算法， 比如添加或者删除元组中的元素，重新排序元组中的元素，或者选取元组中元素的某些子集。
+
+我们可以将元组用作类型列表，如果忽略掉元组模板在运行期间的相关部分，可以发现其结构和Typelist完全一样，事实上，通过使用一些部分特例化，可以将元组变成一个功能完整的Typelist：
+
+```c++
+// determine whether the tuple is empty:
+template<>
+struct IsEmpty<Tuple<>> {
+	static constexpr bool value = true;
+};
+// extract front element:
+template<typename Head, typename… Tail>
+class FrontT<Tuple<Head, Tail…>> {
+public:
+	using Type = Head;
+};
+// remove front element:
+template<typename Head, typename… Tail>
+class PopFrontT<Tuple<Head, Tail…>> {
+public:
+	using Type = Tuple<Tail…>;
+};
+// add element to the front:
+template<typename… Types, typename Element>
+class PushFrontT<Tuple<Types…>, Element> {
+public:
+	using Type = Tuple<Element, Types…>;
+};
+// add element to the back:
+template<typename… Types, typename Element>
+class PushBackT<Tuple<Types…>, Element> {
+public:
+	using Type = Tuple<Types…, Element>;
+};
+```
+
+接下来要实现如何添加以及删除元素：
+
+```c++
+template<typename… Types, typename V>
+PushFront<Tuple<Types…>, V>
+pushFront(Tuple<Types…> const& tuple, V const& value)
+{
+	return PushFront<Tuple<Types…>, V>(value, tuple);
+}
+
+// basis case
+template<typename V>
+Tuple<V> pushBack(Tuple<> const&, V const& value)
+{
+	return Tuple<V>(value);
+}
+// recursive case
+template<typename Head, typename… Tail, typename V>
+Tuple<Head, Tail…, V>
+pushBack(Tuple<Head, Tail…> const& tuple, V const& value)
+{
+    return Tuple<Head, Tail…, V>(tuple.getHead(),
+    					pushBack(tuple.getTail(), value));
+}
+
+template<typename… Types>
+PopFront<Tuple<Types…>> popFront(Tuple<Types…> const& tuple)
+{
+	return tuple.getTail();
+}
+```
+
+元组的反转实现如下：
+
+```c++
+// basis case
+Tuple<> reverse(Tuple<> const& t)
+{
+	return t;
+}
+// recursive case
+template<typename Head, typename… Tail>
+Reverse<Tuple<Head, Tail…>> reverse(Tuple<Head, Tail…> const& t)
+{
+	return pushBack(reverse(t.getTail()), t.getHead());
+}
+```
+
+上文中反转元组在运行期间效率非常低，为了展现这一问题，引入可以计算其实例可以被copy次数的类：
+
+```c++
+template<int N>
+struct CopyCounter
+{
+    inline static unsigned numCopies = 0;
+    CopyCounter()
+    {
+    }
+    CopyCounter(CopyCounter const&) {
+    	++numCopies;
+    }
+};
+
+//创建并反转一个包含CopyCounter实例的元组：
+void copycountertest()
+{
+    Tuple<CopyCounter<0>, CopyCounter<1>, CopyCounter<2>, CopyCounter<3>,
+    CopyCounter<4>> copies;
+    auto reversed = reverse(copies);
+    std::cout << "0: " << CopyCounter<0>::numCopies << " copies\n";
+    std::cout << "1: " << CopyCounter<1>::numCopies << " copies\n";
+    std::cout << "2: " << CopyCounter<2>::numCopies << " copies\n";
+    std::cout << "3: " << CopyCounter<3>::numCopies << " copies\n";
+    std::cout << "4: " << CopyCounter<4>::numCopies << " copies\n";
+}
+//结果如下：
+0: 5 copies
+1: 8 copies
+2: 9 copies
+3: 8 copies
+4: 5 copies
+```
+
+我们希望可以通过索引列表将简单的一致长度的元组反转，使其只进行一次拷贝，比如：
+
+```c++
+auto reversed = makeTuple(get<4>(copies), get<3>(copies), get<2>(copies),
+get<1>(copies), get<0>(copies));
+```
+
+在14中引入的标准类型std::integer_sequence通常被用来表示索引列表。索引列表是一种包含了数值的类型列表，因此可以使用24.3中的Valuelist，上文中的索引列表可以写成`Valuelist\<unsigned, 4, 3, 2, 1, 0\>`。那么如何生成一个索引列表，一种方式是使用一个简单的元函数：
+
+```c++
+// recursive case
+template<unsigned N, typename Result = Valuelist<unsigned>>
+struct MakeIndexListT
+: MakeIndexListT<N-1, PushFront<Result, CTValue<unsigned, N-1>>>
+{};
+// basis case
+template<typename Result>
+struct MakeIndexListT<0, Result>
+{
+	using Type = Result;
+};
+template<unsigned N>
+using MakeIndexList = typename MakeIndexListT<N>::Type;
+```
+
+现在就可以结合MakeIndexlist和24.2.4节介绍的类型列表的Reverse算法，生成需要的索引列表：
+
+```c++
+using MyIndexList = Reverse<MakeIndexList<5>>;
+// equivalent to Valuelist<unsigned, 4, 3, 2,1,0>
+```
+
+为了实现反转，需要将索引列表中的索引捕获进一个非类型参数包，可以将reverse分成两部分实现：
+
+```c++
+template<typename… Elements, unsigned… Indices>
+auto reverseImpl(Tuple<Elements…> const& t, Valuelist<unsigned, Indices…>) //11中通过尾置返回类型 -> decltype(makeTuple(get<Indices>(t)…))
+{
+	return makeTuple(get<Indices>(t)…);
+}
+template<typename… Elements>
+auto reverse(Tuple<Elements…> const& t) //-> decltype(reverseImpl(t, Reverse<MakeIndexList<sizeof… (Elements)>>())
+{
+	return reverseImpl(t, Reverse<MakeIndexList<sizeof…(Elements)>>());
+}
+```
+
+还可以实现洗牌和选择算法：
+
+```c++
+template<typename… Elements, unsigned… Indices>
+auto select(Tuple<Elements…> const& t, Valuelist<unsigned, Indices…>)
+{
+	return makeTuple(get<Indices>(t)…);
+}
+```
+
+### 元组的展开
+
+在需要将一组相关的数值存储到一个变量中时，元组会很有用，某些情况下，可能需要展开元组。我们可以创建一个函数模板apply接收一个函数和一个元组作为参数，然后以展开的元组元素作为参数去调用这个参数：
+
+```c++
+template<typename F, typename… Elements, unsigned… Indices>
+auto applyImpl(F f, Tuple<Elements…> const& t,
+Valuelist<unsigned, Indices…>) ->decltype(f(get<Indices>(t)…))
+{
+	return f(get<Indices>(t)…);
+}
+template<typename F, typename… Elements, unsigned N = sizeof…(Elements)>
+auto apply(F f, Tuple<Elements…> const& t) ->decltype(applyImpl(f, t,
+MakeIndexList<N>()))
+{
+	return applyImpl(f, t, MakeIndexList<N>());
+}
+```
+
+### 元组的优化
+
+上文实现的元组，其存储方式所需要的空间要比严格意义上需要的多，其中一个问题是tail成员最终会是一个空的数值（因为所有非空的元组都会以一个空的元组作为结束，而任意数据成员总会至少占用一个字节的内存）。为了提高元组的存储效率，可以使用21.1的空基类优化，让元组继承自一个尾元组，而不是将尾元组作为一个成员，比如：
+
+```c++
+// recursive case:
+template<typename Head, typename… Tail>
+class Tuple<Head, Tail…> : private Tuple<Tail…>
+{
+private:
+	Head head;
+public:
+    Head& getHead() { return head; }
+    Head const& getHead() const { return head; }
+    Tuple<Tail…>& getTail() { return *this; }
+    Tuple<Tail…> const& getTail() const { return *this; }
+};
+```
+
+这种实现也有问题，颠倒了元组元素在构造函数中被初始化的顺序，现在tail要比head成员早构造，这一问题可以通过将head成员放入自身的基类中，并让这个基类在基类列表中排在tail前面来解决：
+
+```c++
+template<typename... Types>
+class Tuple;
+template<typename T>
+class TupleElt
+{
+T value;
+public:
+    TupleElt() = default;
+    template<typename U>
+    TupleElt(U&& other) : value(std::forward<U>(other) { }
+    T& get() { return value; }
+    T const& get() const { return value; }
+};
+// recursive case:
+template<typename Head, typename... Tail>
+class Tuple<Head, Tail...>
+: private TupleElt<Head>, private Tuple<Tail...>
+{
+public:
+    Head& getHead() {
+        // potentially ambiguous
+        return static_cast<TupleElt<Head> *>(this)->get();
+    }
+    Head const& getHead() const {
+        // potentially ambiguous
+        return static_cast<TupleElt<Head> const*>(this)->get();
+    }
+    Tuple<Tail...>& getTail() { return *this; }
+    Tuple<Tail...> const& getTail() const { return *this; }
+};
+// basis case:
+template<>
+class Tuple<> {
+// no storage required
+};
+```
+
+但这个方法又引入了一个新的问题：如果一个元组包含两个类型相同的元素，我们将不能从中提取元素，因为此时从Tuple\<int, int\>到TupleElt\<int\>的转换（自派生类到基类）不是唯一的。为了保证Tuple中每一个TupleElt基类都是唯一的，一种方式是将高度信息（也就是tail元组的长度信息）编码进元组，比如最后一个元素的高度会存为0，倒数第一个会存为1：
+
+```c++
+template<unsigned Height, typename T>
+class TupleElt {
+	T value;
+public:
+    TupleElt() = default;
+    template<typename U>
+    TupleElt(U&& other) : value(std::forward<U>(other)) { }
+    T& get() { return value; }
+    T const& get() const { return value; }
+};
+
+template<typename... Types>
+class Tuple;
+// recursive case:
+template<typename Head, typename... Tail>
+class Tuple<Head, Tail...>
+: private TupleElt<sizeof...(Tail), Head>, private Tuple<Tail...>
+{
+	using HeadElt = TupleElt<sizeof...(Tail), Head>;
+public:
+    Head& getHead() {
+    	return static_cast<HeadElt *>(this)->get();
+    }
+    Head const& getHead() const {
+    	return static_cast<HeadElt const*>(this)->get();
+    }
+    Tuple<Tail...>& getTail() { return *this; }
+    Tuple<Tail...> const& getTail() const { return *this; }
+};
+// basis case:
+template<>
+class Tuple<> {
+// no storage required
+};
+```
+
+接下来是实现一个常数时间的get，其思路为当用一个（基类类型）的参数去适配一个（派生类类型）的参数时，模板参数推导会为基类推断出模板参数的类型，因此如果我们能够计算出目标元素的高度，就不用遍历所有的索引，也能够基于从Tuple的特化结果向TupleElt\<H, T\>的转化提取出相应的元素：
+
+```c++
+template<unsigned H, typename T>
+T& getHeight(TupleElt<H,T>& te)
+{
+	return te.get();
+}
+template<typename... Types>
+class Tuple;
+template<unsigned I, typename... Elements>
+auto get(Tuple<Elements...>& t) ->
+decltype(getHeight<sizeof...(Elements)-I-1>(t))
+{
+	return getHeight<sizeof...(Elements)-I-1>(t);
+}
+```
+
+查找工作是调用getHeight时的参数推导执行的：由于H是在函数调用时显式指定，因此它的值是确定的，这样就会有一个TupleElt会被匹配到，其目标参数T则是通过推断得到，这里必须要将getHeight声明为Tuple的friend，否则无法执行派生类向private父类的转换，比如：
+
+```c++
+// inside the recursive case for class template Tuple:
+template<unsigned I, typename… Elements>
+friend auto get(Tuple<Elements…>& t)
+-> decltype(getHeight<sizeof…(Elements)-I-1>(t));
+```
+
+### 元组下标
+
+使用24.3介绍的CTValue，可以将数值索引编码进一个类型，将其用于元组下标运算符定义的代码如下：
+
+```c++
+template<typename T, T Index>
+auto& operator[](CTValue<T, Index>) {
+	return get<Index>(*this);
+}
+
+auto t = makeTuple(0, ’1’, 2.2f, std::string{"hello"});
+auto a = t[CTValue<unsigned, 2>{}];
+auto b = t[CTValue<unsigned, 3>{}]；
+```
+
+为了使得常量索引更方便，可以用constexpr实现一种字面常量运算符，专门用来直接从_c结尾的常规字面常量计算出所需的编译期数值字面常量：
+
+```c++
+#include "ctvalue.hpp"
+#include <cassert>
+#include <cstddef>
+// convert single char to corresponding int value at compile time:
+constexpr int toInt(char c) {
+    // hexadecimal letters:
+    if (c >= ’A’ && c <= ’F’) {
+        return static_cast<int>(c) - static_cast<int>(’A’) + 10;
+    }
+    if (c >= ’a’ && c <= ’f’) {
+   		return static_cast<int>(c) - static_cast<int>(’a’) + 10;
+    }
+    // other (disable ’.’ for floating-point literals):
+    assert(c >= ’0’ && c <= ’9’);
+    return static_cast<int>(c) - static_cast<int>(’0’);
+}
+// parse array of chars to corresponding int value at compile time:
+template<std::size_t N>
+constexpr int parseInt(char const (&arr)[N]) {
+    int base = 10; // to handle base (default: decimal)
+    int offset = 0; // to skip prefixes like 0x
+    if (N > 2 && arr[0] == ’0’) {
+        switch (arr[1]) {
+            case ’x’: //prefix 0x or 0X, so hexadecimal
+            case ’X’:
+                base = 16;
+                offset = 2;
+                break;
+            case ’b’: //prefix 0b or 0B (since C++14), so binary
+            case ’B’:
+                base = 2;offset = 2;
+                break;
+            default: //prefix 0, so octal
+                base = 8;
+                offset = 1;
+                break;
+    	}
+	}
+// iterate over all digits and compute resulting value:
+    int value = 0;
+    int multiplier = 1;
+    for (std::size_t i = 0; i < N - offset; ++i) {
+        if (arr[N-1-i] != ’\’’) { //ignore separating single quotes (e.g. in 		1’
+        000)
+            value += toInt(arr[N-1-i]) * multiplier;
+            multiplier *= base;
+        }
+    }
+    return value;
+}
+// literal operator: parse integral literals with suffix _c as sequence of chars:
+template<char… cs>
+constexpr auto operator"" _c() {
+return CTValue<int, parseInt<sizeof…(cs)>({cs…})>{};
+}
+```
+
+## 可辨识联合
+
+联合对应的类型将包含单个值，该值是从一些可能类型中选择的类型。本章开发了一个类模板Variant，可以动态存储给定的一组值类型的一个值，类似于17中的std::variant<>。比如：
+
+```c++
+Variant<int, double, string> field;
+```
+
+可以存储整型、双精度或者字符串，但只能存储其中一个值。可以使用成员函数is\<T\>来测试Variant当前是否包含类型为T的值，然后使用成员函数get\<T\>获取存储值。
+
+### 存储
+
+一个Variant需要存储一个值，还需要存储一个辨别器，用来指示哪个是可能的类型：
+
+```c++
+#include <new> // for std::launder()
+
+template<typename... Types>
+class VariantStorage {
+    using LargestT = LargestType<Typelist<Types...>>;
+    alignas(Types...) unsigned char buffer[sizeof(LargestT)];
+    unsigned char discriminator = 0;
+public:
+    unsigned char getDiscriminator() const { return discriminator; }
+    void setDiscriminator(unsigned char d) { discriminator = d; }
+    void* getRawBuffer() { return buffer; }
+    const void* getRawBuffer() const { return buffer; }
+
+    template<typename T>
+    T* getBufferAs() { return std::launder(reinterpret_cast<T*>(buffer)); }
+    template<typename T>
+    T const* getBufferAs() const {
+    	return std::launder(reinterpret_cast<T const*>(buffer));
+    }
+};
+```
+
+### 设计
+
+与Tuple类型一样，可以使用继承来为Types列表提供每个类型的行为，与Tuple不同的是，这些基类不会存储，每个基类使用21.2中讨论的奇异递归模板模式（CRTP），通过派生最多的类型访问共享变量。下面的类模板提供了在变量的活动值为T类型时，对缓冲区进行操作所需的操作：
+
+```c++
+#include "findindexof.hpp"
+template<typename T, typename... Types>
+class VariantChoice {
+    using Derived = Variant<Types...>;
+    Derived& getDerived() { return *static_cast<Derived*>(this); }
+    Derived const& getDerived() const {
+    	return *static_cast<Derived const*>(this);
+    }
+protected:
+ // compute the discriminator to be used for this type
+ constexpr static unsigned Discriminator =
+ FindIndexOfT<Typelist<Types...>, T>::value + 1;
+public:
+ VariantChoice() { }
+ VariantChoice(T const& value); // see variantchoiceinit.hpp
+ VariantChoice(T&& value); // see variantchoiceinit.hpp
+ bool destroy(); // see variantchoicedestroy.hpp
+ Derived& operator= (T const& value); // see variantchoiceassign.hpp
+ Derived& operator= (T&& value); // see variantchoiceassign.hpp
+};
+    
+template<typename List, typename T, unsigned N = 0,
+	bool Empty = IsEmpty<List>::value>
+struct FindIndexOfT;
+// recursive case:
+template<typename List, typename T, unsigned N>
+struct FindIndexOfT<List, T, N, false>
+   : public IfThenElse<std::is_same<Front<List>, T>::value,
+	std::integral_constant<unsigned, N>,
+FindIndexOfT<PopFront<List>, T, N+1>>
+{
+};
+// basis case:
+template<typename List, typename T, unsigned N>
+struct FindIndexOfT<List, T, N, true>
+{
+};
+```
+
+Variant的框架如下：
+
+```c++
+template<typename... Types>
+class Variant
+: private VariantStorage<Types...>,
+private VariantChoice<Types, Types...>...
+{
+    template<typename T, typename... OtherTypes>
+    friend class VariantChoice; // enable CRTP
+    ...
+};
+```
+
+### 值的查询与提取
+
