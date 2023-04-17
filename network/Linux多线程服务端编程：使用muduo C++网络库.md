@@ -668,3 +668,512 @@ Event loop有一个明显的缺点，就是它是非抢占的，假设事件a优
 ## C++多线程系统编程精要
 
 ### 基本线程原语的选用
+
+11个最基本的pthread函数为：
+
+- 2个：线程的创建和等待结束；
+- 4个：mutex的创建、销毁、加锁、解锁；
+- 5个：条件变量的创建、销毁、等待、通知、广播；
+
+可以酌情使用的有：
+
+- pthread_once，封装为muduo::Singleton<T>，不如直接用全局变量；
+- pthread_key*，封装为muduo::ThreadLocal<T>，可以考虑用__thread替换；
+
+不建议使用：
+
+- pthread_rwlock，读写锁慎用；
+- sem_*：避免用信号量，功能与条件变量重合，容易出错；
+- pthread_{cancel, kill}，出现它们通常意味着设计出了问题；
+
+### Linux上的线程标识
+
+posix threads提供了pthread_self函数用于返回当前进程的标识符，其类型为pthread_t，pthread_t不一定是一个数值类型（整数或指针），还有可能是一个结构体，因此pthreads提供了pthread_equal来用于对比两个线程标识符是否相等，这会带来一系列的问题：
+
+- 无法打印输出pthread_t；
+- 无法比较pthread_t的大小或计算其hash值，因此无法用于关联容器的key；
+- 无法定义一个非法的pthread_t的值，用来表示绝对不存在的线程id；
+- pthread_t值只在进程内有意义，与操作系统的任务调度之间无法建立有效的关联，比如想在/proc文件系统里找对应的task；
+
+不仅如此，glibc实际把pthread_t用作一个结构体指针，指向一块动态分配的内存，而这块内存经常被使用，这很容易会造成两个pthread_t的值相同。综上，pthread_t并不适合用于在程序中对线程的标识符，在linux上建议使用gettid(2)系统调用的返回值用作线程id，好处有：
+
+- 类型是pid_t，其值通常是一个小整数，方便在日志中输出；
+- 在现代linux中，直接表示内核的任务调度id，因此在/proc里可以找到，比如/proc/tid或/prod/pid/task/tid；
+- 在其他系统工具中也容易定位，比如top(1)；
+- 任何时候都是全局唯一的；
+- 0是非法值，因为操作系统第一个进程init的pid是1；
+
+muduo::CurrentThread::tid()封装是用__thread变量来缓存gettid(2)的返回值，这样只有在本线程第一次调用时才进行系统调用，以后都是直接从thread local缓存的线程id中拿到结果。
+
+### 线程创建与销毁的守则
+
+线程的创建要遵循几条简单的原则：
+
+- 程序库不应该在未提前告知的情况下创建自己的背景线程；
+- 尽量用相同方式创建线程，例如muduo::Thread；
+- 在进入main函数之前不应该启动线程；
+- 线程的创建最好在初始化阶段全部完成；
+
+线程是稀缺资源，一个进程可以创建的并发线程数目受限于地址空间的大小和内核参数，一台机器可以同时并行运行的线程数目受限于CPU的数目，因此要精心规划线程的数目，为关键任务保留足够的计算资源，如果程序库背地里使用了额外的线程，资源规划就漏算了。还有一个重要的原因，一旦程序中不止有一个线程，就很难安全的fork。使用相同方式创建线程方便我们管理线程。main函数之前不应该启动线程，是因为会影响全局对象的安全构造。不要为了每个计算任务去请求创建线程是为了尽量避免thrashing，导致机器失去响应，这样我们不能探查机器在失去响应之后究竟在做什么，在程序运行期间不再创建和销毁线程，使得我们更容易把计算任务和IO任务分配给已有的线程，代价只有新建线程的几分之一。
+
+线程的销毁有几种方式：
+
+- 自然死亡，从线程主函数返回，线程正常退出；
+- 非正常死亡，从线程主函数抛出异常或线程触发段错误等非法操作；
+- 自杀，在线程中调用pthread_exit立刻退出线程；
+- 他杀，其他线程调用pthread_cancel来强制终止某个线程；
+
+只有第一种方式是合理的设计。如果确实需要强行终止一个耗时很长的计算任务，又不想在计算期间周期的检查某个全局退出标志，可以考虑把这部分代码fork为新的进程，这样杀一个进程比杀进程内线程要安全的多。当然fork的新进程与本进程的通信方式也要慎重，最好用文件描述符（pipe(2)/socketpair(2)/TCP socket）来收发数据，而不要用共享内存和跨进程的互斥器等IPC，因为这样仍然有死锁的可能。
+
+posix threads有取消点这个概念，意思是线程执行到这里有可能被终止（如果别的线程对它调用了pthread_cancel的话）；在C++中，cancellation point实现与C不同，线程不是执行到此函数立刻终止，还是会抛出异常，这样有机会执行stack unwind，析构栈上对象。
+
+exit(3)在C++中作用除了终止进程，还会析构全局对象和已经构造完的函数静态对象，这有潜在死锁的可能。比如：
+
+```c++
+void someFunctionMayCallExit()
+{
+	exit(1);
+}
+class GlobalObject // : boost::noncopyable
+{
+public:
+    void doit()
+    {
+        MutexLockGuard lock(mutex_);
+        someFunctionMayCallExit();
+    }
+    ～GlobalObject()
+    {
+        printf("GlobalObject:～GlobalObject\n");
+        MutexLockGuard lock(mutex_); // 此处发生死锁
+        // clean up
+        printf("GlobalObject:～GlobalObject cleanning\n");
+    }
+private:
+	MutexLock mutex_;
+};
+
+GlobalObject g_obj;
+int main()
+{
+	g_obj.doit();
+}
+```
+
+如果确实需要主动结束线程，可以考虑用_exit(2)系统调用，它不会试图析构全局对象，但是也不会执行其他任何清理工作，比如flush标准输出。
+
+### 善用__thread关键字
+
+__thread是gcc内置的线程局部存储设施，其实现非常高效，其存取效率可与全局变量相比。\_\_thread只能修饰POD类型（简单的旧数据，一个POD类型没有用户定义的构造、拷贝构造、析构和赋值运算符，没有虚函数和虚基类，所有的非静态成员都是POD类型或者是一个数组，没有类类型的非静态成员有默认构造函数），不能修饰class类型，因为无法自动调用构造和析构函数，可以修饰全局变量、函数内的静态变量，但是不能修饰函数的局部变量或者class的普通成员变量，另外，\_\_thread变量的初始化只能用编译期常量，例如：
+
+```c++
+__thread string t_obj1("Chen Shuo"); // 错误，不能调用对象的构造函数
+__thread string* t_obj2 = new string; // 错误，初始化必须用编译期常量
+__thread string* t_obj3 = NULL; // 正确，但是需要手工初始化并销毁对象
+
+```
+
+\_\_thread变量每个线程有一份独立实体，各个线程的变量值互不打扰，除此之外，其还可以修饰哪些“值可能会变，带有全局性，但又不值得用全局锁保护”的变量。
+
+### 多线程与IO
+
+可以用多线程处理同一个socket用以提高效率吗？首先，操作文件描述符的系统调用本身是线程安全的，不必担心多个线程同时操作造成进程崩溃或内核崩溃，但是多个线程操作同一个socket文件确实很麻烦，作者认为得不偿失。
+
+作者推荐的原则是：每个文件描述符只由一个线程操作，从而轻松解决消息收发的顺序问题，也避免了关闭文件描述符的各种race condition。一个线程可以操作多个文件描述符，但一个线程不能操作别的线程拥有的文件描述符。
+
+epoll也遵循相同的原则，同一个epoll fd的操作应该都放在同一个线程执行。
+
+这条规则有两个例外：对于磁盘文件，必要的时候多个线程可以同时调用pread(2)/pwrite(2)来读写同一个文件；对于UDP，由于协议本身保证消息的原子性，在适当的条件下可以多个线程同时读写同一个UDP描述符。
+
+### 用RAII包装文件描述符
+
+linux中关于文件描述符，0是标准输入，1是标准输出，2是标准错误，如果新打开一个文件，其文件描述符会是3，因为posix标准要求每次新打开文件的时候必须使用当前最小可用的文件描述符号码，这可能造成串话，比如正在使用某个文件描述符，结果这个文件描述符突然关闭，另一个task打开了新的文件描述符，很可能当前操作使用了这个新的文件描述符。解决方法就是RAII，用Socket对象包装文件描述符。只要Socket对象还活着，就不会有其他Socket对象跟它有一样的文件描述符。
+
+为了防止访问失效的对象或者发生网络串话，muduo使用shared_ptr来管理TcpConnection的生命周期。
+
+### RAII与fork
+
+我们可以用对象包装资源，把资源管理与对象生命周期管理统一起来，但是如果程序fork之后，这个假设就会被破坏。fork之后，子进程继承了父进程的几乎全部资源，但也有少数例外。子进程会继承地址空间和文件描述符，但不会继承：
+
+- 父进程的内存锁，mlock(2)、mlockall(2)；
+- 父进程的文件锁，fcntl(2)；
+- 父进程的某些定时器，settimer(2)、alarm(2)、timer_create(2)等；
+- 其他，见man 2 fork；
+
+通常我们会用RAII手法管理以上种类的资源，但在fork出来的子进程中不一定正常工作，因为资源在fork时已经被释放。因此在编写服务端程序的时候是否允许fork是在一开始就应该慎重考虑的。
+
+### 多线程与fork
+
+fork一般不能在多线程程序中调用，因为linux的fork只克隆当前线程的thread of control，不克隆其他线程，fork之后除了当前线程之外其他线程都消失了。这样会造成一个危险的局面，其他线程正好位于临界区，持有某个锁，而它突然死亡，再也没机会解锁，如果子进程再试图对同一个mutex加锁就会立即死锁。在fork之后，子进程相当于处于signal handler中，不能调用线程安全的函数（除非是可重入的），而只能调用异步信号安全的函数，比如fork之后，子进程不能调用：
+
+- malloc(3)，因为malloc在全局访问的状态下肯定会加锁；
+- 任何可能分配或释放内存的函数，包括new、map::insert()、snprintf……
+- 任何Pthreads函数，不能用pthread_cond_signal去通知父进程，只能通过pipe(2)来同步；
+- printf系列函数，因为其他线程可能恰好持有stdout/stderr的锁；
+- 除了man 7 signal中明确列出的signal安全函数之外的任何函数；
+
+照此看来唯一安全的做法是fork之后立即调用exec执行另一个程序，彻底隔断父子进程的联系。不得不说，同样是创建进程，windows的CreateProcess函数的顾虑要少得多，因为它创建的进程跟当前进程关联较少。
+
+### 多线程与signal
+
+单线程时代，编写信号处理函数是一件棘手的事情，由于signal打断了正在运行的thread of control，在signal handler中只能调用async-signal-safe的函数，即所谓的可重入函数。还有一点，如果signal handler中需要修改全局数据，那么被修改的变量必须是sig_atomic_t类型的，否则被打断的函数在恢复执行后很可能不能立即看到signale handler改动后的数据，因为编译器有可能假定这个变量不会被他处修改从而优化了内存访问。
+
+多线程时代，signal语义更加复杂，信号分为两类：发送给某一线程（SIGSEGV），发送给进程中的任一线程（SIGTERM），还有考虑掩码对信号的屏蔽。特别在signal handler中不能调用任何pthreads函数，不能通过condition variable来通知其他线程。在多线程程序中，使用signal的第一原则是不要使用signal，包括：
+
+- 不要用signal作为IPC的手段，包括不要SIGUSR1等来触发服务端的行为，如果确实需要，可以用9.5介绍的增加监听端口的方式来实现双向的、可远程访问的进程控制；
+- 也不要使用基于signal实现的定时函数，包括alarm/ualarm/setitimer/timer_create/sleep/usleep等；
+- 不主动处理各种异常信号（SIGTERM、SIGINT等等），只用默认语义：结束进程。有一个例外：SIGPIPE，服务器程序常用的做法是忽略此信号，否则如果对方断开连接，而本机继续write的话会导致程序意外终止；
+- 在没有别的替代方法的情况下（比如说处理SIGCHLD信号），把异步信号转换为同步的文件描述符时间，传统的做法是在signal handler里往一个特定的pipe(2)写一个字节，在主程序的从这个pipe读取，从而纳入统一的IO事件处理框架中去。现代linux的做法是采用signalfd(2)把信号直接转换为文件描述符事件，从而从根本上避免使用signal handler。
+
+### linux新增系统调用的启示
+
+大致从linux内核2.6.27起，凡是会创建文件描述符的syscall一般都增加了额外的flag参数，可以直接指定O_NONBLOCK和FD_CLOEXEC，例如accept4-2.6.28、eventfd2-2.6.27、inotify_init1-2.6.27、pipe2-2.6.27、signalfd4-2.6.27、timerfd_create-2.6.25。O_NONBLOCK的功能是开启非阻塞IO，而文件描述符默认是阻塞的。FD_CLOEXEC是让程序exec时，进程会自动关闭这个文件描述符，以防止该文件描述符被子进程继承。
+
+## 高效的多线程日志
+
+对于关键进程，日志通常要记录：
+
+1. 收到的每条内部消息的id；
+2. 收到的每条消息的全文；
+3. 发出的每条消息的全文，每条消息都有全局唯一的id；
+4. 关键内部状态的变更等等；
+
+一个日志库大体可分为前端和后端，前端是供程序使用的接口，生成日志消息，后端则负责把日志消息写到目的地，这两部分的接口有可能简单到只有一个回调函数：`void output(const char* message, int len);`   其中message是一条完整的日志消息，包含日志级别、时间戳、源文件位置、线程id等基本字段以及消息的具体内容。在多线程程序中，写日志是个典型的多生产者单消费者问题，对生产者（前端）来说，要尽量做到低延迟、低cpu开销、无阻塞，对消费者（后端）而言，要做到足够大的吞吐量，并占用较少资源。对C++而言，最好整个程序都使用相同的日志库，从这个意义来说，日志库是个单例，C++日志库的前端大体有两种API风格：
+
+- C/Java的printf(fmt, ...)风格；
+- C++的stream<<风格；
+
+muduo日志库是C++ stream风格，其不必费心保持格式字符串与参数类型的一致性，随用随写，而且类型安全。另一个好处是当输出日志的基本高于语句的日志级别时，打印日志是个空操作。
+
+往文件写日志的一个常见问题是万一程序崩溃，最后若干条日志往往丢失，因为日志库不能每条消息都flush硬盘，更不能每条消息都open/close文件，这样性能开销太大，muduo日志库用两个方法来应对，其一是定期（默认3s）将缓冲区消息flush到硬盘，其二是每条内存中的日志消息都带有cookie，其值为某个函数的地址，这样通过来core dump文件中查找cookie就能找到尚未来得及写入到磁盘的消息。
+
+日志消息格式有几个要点：
+
+- 尽量每条日志占一行，容易用awk、sed、grep等命令行等工具快速联机分析日志；
+- 时间戳精确到微秒，每条消息通过gettimeofday(2)获取当前时间不会有什么性能损失，因为在linux中gettimeofday(2)不是系统调用不会陷入内核；
+- 始终使用GMT时区，省去了时区的转换；
+- 打印线程id；
+- 打印日志级别；
+- 打印源文件名和行号；
+
+### 性能需求
+
+日志库只有高效，才能让程序员敢于在代码中输出足够多的诊断信息，减小运维难度，提高效率，高效性体现在以下几个方面：
+
+- 每秒写几千上万条日志的时候没有明显的性能损失；
+- 能应对一个进程产生大量日志的场景；
+- 不阻塞正常的执行流程；
+- 在多线程中，不造成争用；
+
+作者列了一些具体的性能指标，考虑往普通7200rpm SATA硬盘写日志文件的情况：
+
+- 磁盘带宽约为110MB/s，日志库应该能瞬间写完带宽；
+- 假如每条消息平均长度为110字节，意味着1s要写100万条日志；
+
+muduo日志库的优化措施比较突出的是：
+
+- 时间戳字符串中的日期和时间两部分是缓存的，一秒之内多条日志只需要重新格式化微秒部分；
+- 日志消息的前4个字段是定长的，可以避免在运行期求字符串长度；
+- 线程id是预先格式化为字符串，在输出日志消息的时候只需要简单拷贝几个字节；
+- 每行日志消息的源文件名部分采用了编译期计算来获得basename；
+
+### 多线程异步日志
+
+作者认为多线程程序最好只写一个日志文件，用一个背景线程负责收集日志消息并写入文件，其他业务线程只管往这个日志线程发送日志消息，这称为异步日志。需要一个队列将日志前端的数据传送到后端，但这个队列不必是现成的BlockingQueue\<std::string\>，因为不用每产生一条日志消息都通知接收方。
+
+muduo日志库采用的是双缓冲技术，即准备两块bufferA和B，前端负责往A里面填数据，后端负责将B中的数据写入到文件，当A写满后交换A和B的数据，让后端将A中的数据写入，这样的好处是批处理数据，减少了线程唤醒的频率降低了开销。另外为了及时将消息写入文件，即使A未满，日志库也会每3s执行一次上述交换写入操作。
+
+## muduo网络库简介
+
+### 使用教程
+
+作者认为TCP网络编程最本质的是处理三个半事件：
+
+1. 连接的建立，包括服务端接收新连接（accept）和客户端成功发起连接（connect）；
+2. 连接的断开，包括主动断开（close、shutdown）和被动断开（read(2)返回0）；
+3. 消息到达，文件描述符可读，这是最为重要的一个事件，对它的处理方式决定了网络编程的风格（阻塞还是非阻塞，如何处理分包，应用层的缓冲如何设计等待）；
+4. 消息发送完毕，这算半个，对于低流量的服务可以不必关心这个事件，另外这里的发送完毕指的是将数据写入操作系统的缓冲区，将由TCP协议栈负责数据的发送和重传，不代表对方已经收到数据；
+
+## muduo编程示例
+
+### 五个简单的TCP示例
+
+本节介绍五个简单的TCP网络服务程序，包括echo、discard、chargen、daytime、time这五个协议，以及time协议的客户端，各程序的协议简介如下：
+
+- discard：丢失所有收到的数据；
+- daytime：服务端连接后，以字符串形式发送当前时间，然后主动断开连接；
+- time：服务端accept连接之后，以二进制的形式发送当前时间（从Epoch到现在的秒数），然后主动断开连接，我们需要一个客户程序把收到的时间转换为字符串；
+- echo：回显服务，把收到的数据发回客户端；
+- chargen：服务端accept连接之后不停发送测试数据；
+
+这五个协议使用不同的端口，可以放在同一个进程中实现，且不必使用多线程。
+
+discard可以算最简单的长连接TCP应用层协议，只需要关注消息/数据到达时间，事件处理函数如下：
+
+```c++
+void DiscardServer::onMessage(const TcpConnectionPtr& conn,
+Buffer* buf,
+Timestamp time)
+{
+    string msg(buf->retrieveAllAsString());
+    LOG_INFO << conn->name() << " discards " << msg.size()
+    << " bytes received at " << time.toString();
+}
+```
+
+daytime是短连接协议，在发送完当前时间后由服务端主动断开连接：
+
+```c++
+void DaytimeServer::onConnection(const TcpConnectionPtr& conn)
+{
+    LOG_INFO << "DaytimeServer - " << conn->peerAddress().toIpPort() << " -> "
+    << conn->localAddress().toIpPort() << " is "
+    << (conn->connected() ? "UP" : "DOWN");
+    if (conn->connected())
+    {
+        conn->send(Timestamp::now().toFormattedString() + "\n");
+        conn->shutdown();
+    }
+}
+
+```
+
+time与daytime类似，但它返回的是一个32bit的整数：
+
+```c++
+void TimeServer::onConnection(const muduo::net::TcpConnectionPtr& conn)
+{
+    LOG_INFO << "TimeServer - " << conn->peerAddress().toIpPort() << " -> "
+    << conn->localAddress().toIpPort() << " is "
+    << (conn->connected() ? "UP" : "DOWN");
+    if (conn->connected())
+    {
+        time_t now = ::time(NULL);
+        int32_t be32 = sockets::hostToNetwork32(static_cast<int32_t>(now));
+        conn->send(&be32, sizeof be32);
+        conn->shutdown();
+    }
+}
+
+void onMessage(const TcpConnectionPtr& conn, Buffer＊ buf, Timestamp receiveTime)
+{
+    if (buf->readableBytes() >= sizeof(int32_t))
+    {
+        const void＊ data = buf->peek();
+        int32_t be32 = ＊static_cast<const int32_t＊>(data);
+        buf->retrieve(sizeof(int32_t));
+        time_t time = sockets::networkToHost32(be32);
+        Timestamp ts(time ＊ Timestamp::kMicroSecondsPerSecond);
+        LOG_INFO << "Server time = " << time << ", " << ts.toFormattedString();
+    }
+    else
+    {
+        LOG_INFO << conn->name() << " no enough data " << buf->readableBytes()
+        << " at " << receiveTime.toFormattedString();
+    }
+}
+```
+
+echo是一个双向的协议：
+
+```c++
+void EchoServer::onMessage(const muduo::net::TcpConnectionPtr& conn,
+muduo::net::Buffer＊ buf,
+muduo::Timestamp time)
+{
+    muduo::string msg(buf->retrieveAllAsString());
+    LOG_INFO << conn->name() << " echo " << msg.size() << " bytes, "
+    << "data received at " << time.toString();
+    conn->send(msg);
+}
+
+```
+
+这里有一点数据就发送，是为了避免客户端恶意不发送换行符，导致服务端一直缓存数据导致内存暴涨。但这里其实还有一个漏洞，那就是客户端故意不断发送数据但从不接收，会导致服务端的发送缓冲区一直堆积。解决方法可以参考chargen协议，或者在发送缓冲区堆积到一定大小时主动断开连接。
+
+charge协议只发送数据不接收数据，且发送数据的速度不能快过客户端接收的速度：
+
+```c++
+void ChargenServer::onConnection(const TcpConnectionPtr& conn)
+{
+    LOG_INFO << "ChargenServer - " << conn->peerAddress().toIpPort() << " -> "
+    << conn->localAddress().toIpPort() << " is "
+    << (conn->connected() ? "UP" : "DOWN");
+    if (conn->connected())
+    {
+        conn->setTcpNoDelay(true);
+        conn->send(message_);
+    }
+}
+
+void ChargenServer::onMessage(const TcpConnectionPtr& conn,
+Buffer＊ buf,
+Timestamp time)
+{
+    string msg(buf->retrieveAllAsString());
+    LOG_INFO << conn->name() << " discards " << msg.size()
+    << " bytes received at " << time.toString();
+}
+
+void ChargenServer::onWriteComplete(const TcpConnectionPtr& conn)
+{
+    transferred_ += message_.size();
+    conn->send(message_);
+}
+```
+
+### Boost.Asio的聊天服务器
+
+分包指的是在发送一个消息或一帧数据时通过一定的处理，让接收方能从字节流中识别并截取出一个个消息。对于短连接的TCP服务，分包不是一个问题，只要发送方主动关闭连接，就表示一条消息发送完毕，接收方read返回0从而知道消息的结尾。对于长连接的TCP服务，分包有四种方法：
+
+1. 消息长度固定，比如muduo的roundtrip示例就采用了固定的16字节消息；
+2. 使用特殊的字符或字符串作为消息的边界，例如http协议的headers以及\r\n为字段的分隔符；
+3. 在每条消息的头部加一个长度字段，这恐怕是最常见的做法；
+4. 利用消息本身的格式来分包，例如XML格式中的<root>...</root>配对；
+
+本节介绍的聊天服务的消息格式非常简单，消息本身是一个字符串，每条消息有一个4字节的头部，以网络序存放字符串的长度，消息之间没有间隙，字符串也不要求以"\0"结尾。打包的代码如下：
+
+```c++
+void send(muduo::net::TcpConnection＊ conn,
+const muduo::StringPiece& message)
+{
+    muduo::net::Buffer buf;
+    buf.append(message.data(), message.size());
+    int32_t len = static_cast<int32_t>(message.size());
+    int32_t be32 = muduo::net::sockets::hostToNetwork32(len);
+    buf.prepend(&be32, sizeof be32);
+    conn->send(&buf);
+}
+```
+
+分包的代码如下所示：
+
+```c++
+void onMessage(const muduo::net::TcpConnectionPtr& conn,
+muduo::net::Buffer* buf,
+muduo::Timestamp receiveTime)
+{
+    while (buf->readableBytes() >= kHeaderLen) // kHeaderLen == 4
+    {
+        // FIXME: use Buffer::peekInt32()
+        const void* data = buf->peek();
+        int32_t be32 = *static_cast<const int32_t＊>(data); // SIGBUS
+        const int32_t len = muduo::net::sockets::networkToHost32(be32);
+        if (len > 65536 || len < 0)
+        {
+            LOG_ERROR << "Invalid length " << len;
+            conn->shutdown(); // FIXME: disable reading
+            break;
+        }
+        else if (buf->readableBytes() >= len + kHeaderLen)
+        {
+            buf->retrieve(kHeaderLen);
+            muduo::string message(buf->peek(), len);
+            messageCallback_(conn, message, receiveTime);
+            buf->retrieve(len);
+        }
+        else
+        {
+        	break;
+        }
+    }
+}
+```
+
+服务端注册回调：
+
+```c++
+class ChatServer : boost::noncopyable
+{
+public:
+    ChatServer(EventLoop＊ loop,
+    const InetAddress& listenAddr)
+    : loop_(loop),
+    server_(loop, listenAddr, "ChatServer"),
+    codec_(boost::bind(&ChatServer::onStringMessage, this, _1, _2, _3))
+    {
+        server_.setConnectionCallback(
+        boost::bind(&ChatServer::onConnection, this, _1));
+        server_.setMessageCallback(
+        boost::bind(&LengthHeaderCodec::onMessage, &codec_, _1, _2, _3));
+    }
+
+    void start()
+    {
+    	server_.start();
+    }
+private:
+    void onConnection(const TcpConnectionPtr& conn)
+     {
+         LOG_INFO << conn->localAddress().toIpPort() << " -> "
+         << conn->peerAddress().toIpPort() << " is "
+         << (conn->connected() ? "UP" : "DOWN");
+
+         if (conn->connected())
+         {
+         	connections_.insert(conn);
+         }
+         else
+         {
+         	connections_.erase(conn);
+         }
+    }
+    void onStringMessage(const TcpConnectionPtr&,
+         const string& message,
+         Timestamp)
+     {
+         for (ConnectionList::iterator it = connections_.begin();
+         it != connections_.end();
+         ++it)
+         {
+         	codec_.send(get_pointer(＊it), message);
+         }
+     }
+     typedef std::set<TcpConnectionPtr> ConnectionList;
+     EventLoop＊ loop_;
+     TcpServer server_;
+     LengthHeaderCodec codec_;
+     ConnectionList connections_;
+ };
+```
+
+### muduo Buffer类的设计和使用
+
+event loop是non-blocking网络编程的核心，在现实生活中，non-blocking几乎总是和IO multiplexing一起使用，原因有两点：
+
+- 没人会真的用轮询来检查某个non-blocking IO操作是否完成，那样太浪费CPU；
+- IO multiplexing一般不能和blocking IO用在一起，因为blocking IO中的read/write/accept/connect都有可能阻塞当前线程。
+
+non-blocking IO的核心思想是避免阻塞在read或write或其他IO系统调用上，这样可以最大限度复用thread-of-control，让一个线程可以服务于多个socket连接。IO线程只能阻塞在IO multiplexing函数上，如select/poll/epoll_wait，这样一来，应用层的缓冲是必需的，每个TCP socket都要有stateful的input buffer和output buffer。首先TcpConncetion必须要有output buffer，这是因为数据可能不能一下子发完，比如想要发送100k数据，但在write系统调用中系统只接受了80k（受TCP advertised window控制），那么我们不想要等待，就可以将剩余的数据保存在output buffer中，然后注册POLLOUT事件，一旦socket变得可写，就立即发送数据。如果写完了这剩余的20k，网络库应该立即停止关注POLLOUT，以免造成busy loop。如果程序又写入了50k，这时候output buffer中还有待发送的20k数据，那么网络库不应该直接调用write，而应该把这50k数据append在那20k数据之后，等socket变得可写时候一并写入。如果output buffer还有数据，但程序又想关闭连接，那么必须要等到数据发送完毕。
+
+TcpConnection必须要有input buffer，这是因为TCP是一个无边界的字节流协议，接收方必须要对消息进行分包处理，而网络库在处理socket可读事件的时候必须一次性把socket里的数据读完，否则会反复触发POLLIN事件，造成busy-loop。所以为了应付网络不完整的情况，收到的数据通常先放到input buffer，等构成一条完整的消息再通知程序的业务逻辑。
+
+muduo Buffer的设计要点如下：
+
+- 对外表现为一块连续的内存以方便客户代码的编写；
+- size自动增长以适应不同长度的消息；
+- 内部以vector<char>来保存数据，并提供相应的访问程序；
+
+Buffer其实像一个queue，从末尾写入数据，从头部读出数据。
+
+在非阻塞网络编程中，如何设计并使用缓冲区，muduo的做法是在栈上准备一个65536字节的extrabuf，然后利用readv来读取数据，iovec有两块，第一块指向muduo buffer中的writable字节，另一块指向栈上的extrabuf，这样如果读取的数据不多那么就全部读取到buffer中，如果长度超过buffer的writable字节数，就会读到栈上的extrabuf里，然后再把extrabuf里的数据append到buffer中。
+
+Buffer的内部是一个std::vector<char>，其又两个数据成员指向该vector中的元素，这两个index的类型是int，目的是应对迭代器失效。buffer的结构如图所示：
+
+![buffer](..\image\Network\buffer.png)
+
+Buffer里面有两个常数kCheapPrepend和kInitialSize，定义了prependable的初始大小和writable的初始大小，readable的初始大小为0。
+
+有时候经过若干次读写，readIndex移动的位置靠后，此时我们想要写入300字节可能writable不够，muduo在这种情况下不会分配新的内存，而是把已有的数据移到前面挪出空间。
+
+prependable空间是为了让程序以很低的代价在数据前面添加几个字节。
+
+如果不想用vector，可以自己管理内存，如下：
+
+![muduo-7-23](..\image\Network\muduo-7-23.png)
+
+如果对性能有着极高的要求，受不了copy和resize，可以考虑实现分段连续的zero copy buffer再配合gather scatter IO：
+
+![muduo-7-24](..\image\Network\muduo-7-24.png)
+
+### 限制服务器的最大并发连接数

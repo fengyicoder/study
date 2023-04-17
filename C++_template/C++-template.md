@@ -3718,6 +3718,101 @@ concept GeoObj = requires(T x) {
 
 ![bridgePatten](..\image\template\bridgePatten.png)
 
+## 实例化
+
+### On-Demand实例化
+
+当c++编译期遇到模板特化时候，它会用需要的实参来替换模板参数，然后创造出特化体，这一过程是自动完成的。这一on-demand实例化特性有时也被称为隐式抑或自动实例化。
+
+考虑这样一个例子：
+
+```c++
+template<typename T> class C;	// #1 declaration only
+C<int>* p = 0;					// #2 fine: definition of C<int> not needed
+
+template<typename T>
+class C{
+  public:
+    void f();					// #3 member declaration
+};								// #4 class template definition completed
+
+void g(C<int>& c)				// #5 use class template declaration only
+{
+  c.f();						// #6 use class template definition;
+}								// will need definition of C::f() 
+								// in this translation unit
+								
+template<typename T>
+void C<T>::f()					// required definition due to #6
+{
+}
+```
+
+当某个组件需要知道模板特化体的大小或者访问了这种特化体的成员，那么就需要看到完整的类模板定义，另外，成员函数定义也是需要的。
+
+另外，C++重载解析规则要求，如果候选函数的参数是类类型，那么该类类型必须是可见的。
+
+### 延迟实例化
+
+编译器有时候不需要替换类或函数模板的完整定义，比如：
+
+```c++
+template<typename T> T f(T p) { return 2*p; }
+decltype(f(2)) x = 2;
+```
+
+这里只被允许替换f()的声明，而不是替换整个身体，有时这被称为部分实例化。同样，如果引用类模板的实例而不需要将该实例作为完整类型，则编译期不应对该类模板实例执行完整的实例化，比如：
+
+```c++
+template<typename T> class Q {
+  using Type = typename T::Type;
+};
+
+Q<int>* p = 0;		// OK: the body of Q<int> is not substituted
+```
+
+当类模板隐式（完整）实例化时，其所有的成员的声明也都会进行实例化，但是对应的定义却不会实例化。也有一些特殊情况，比如类模板包含一个匿名的联合体，其成员的定义也会实例化，另一个特殊的情况是虚成员函数，其定义作为模板实例化的结果，可能会也可能不会进行实例化。实例化模板时，默认函数调用实参需要被单独考虑，除非调用该函数时确实使用了默认实参，否则它们不会被实例化，反之，如果调用该函数时显式的指定了实参去覆盖这一默认实参，那么默认实参就不会被实例化。类似，除非有必要，异常规范和默认成员初始化器也不会被实例化。比如以下的例子：
+
+```c++
+template<typename T>
+class Safe {
+};
+
+template<int N>
+class Danger {
+  int arr[N];		// OK here, although would fail for N<=0
+};
+
+template<typename T, int N>
+class Tricky {
+  public:
+    void noBodyHere(Safe<T> = 3);	// OK until usage of default value results in an error
+	void inclass() {
+	  Danger<N> noBoomYet;			// OK until inclass() is used with N<=0
+	}
+	struct Nested {
+	  Danger<N> pfew;				// OK until Nested is used with N<=0
+	};
+	union {							// due anonymous union:
+	  Danger<N> anonymous;			// OK until Tricky is instantiated with N<=0
+	  int aligh;
+	};
+	void unsafe(T (*p)[N]);			// OK until Tricky is instantiated with N<=0
+	void error(){
+	  Danger<-1> boom;				// always ERROR (which not all compilers detect)
+	}
+};
+```
+
+### C++实例化模型
+
+两阶段查找：
+
+1. 第一阶段，当解析模板时，非依赖型名称会用普通查找规则和ADL规则。非受限的依赖型名称（比如函数调用中函数的名称，之所以是依赖型名称是因为它们具有依赖型实参）会使用普通查找规则，但这一查找结果并不会作为最终结果，而是要等到第二阶段的另一个查找过程完成；
+2. 第二阶段，此时模板实例化称为POI(point of instantiation)，依赖型受限名称会在此时被查找（对选定的实例用模板实参替换模板参数），而且还会对非受限依赖型名称进行额外的ADL查找；
+
+
+
 ## 萃取的实现
 
 ### 一个例子：对一个序列求和
@@ -7501,4 +7596,599 @@ private VariantChoice<Types, Types...>...
 ```
 
 ### 值的查询与提取
+
+以下定义的is成员函数，确定Variant当前是否存储T类型的值：
+
+```c++
+template<typename... Types>
+template<typename T>
+bool Variant<Types...>::is() const
+{
+    return this->getDiscriminator() ==
+    	VariantChoice<T, Types...>::Discriminator;
+}
+```
+
+get成员函数提取对存储值的引用，比如：
+
+```c++
+#include <exception>
+
+class EmptyVariant : public std::exception {
+};
+
+template<typename... Types>
+template<typename T>
+T& Variant<Types...>::get() & {
+    if (empty()) {
+    	throw EmptyVariant();
+    }
+
+    assert(is<T>());
+    return *this->template getBufferAs<T>();
+}
+```
+
+### 元素初始化、赋值和销毁
+
+用双精度值初始化Variant<int, double, string>，可以用VariantChoice的构造函数完成，其接收T类型的值：
+
+```c++
+#include <utility> // for std::move()
+
+template<typename T, typename... Types>
+VariantChoice<T, Types...>::VariantChoice(T const& value) {
+    // place value in buffer and set type discriminator:
+    new(getDerived().getRawBuffer()) T(value);
+    getDerived().setDiscriminator(Discriminator);
+}
+
+template<typename T, typename... Types>
+VariantChoice<T, Types...>::VariantChoice(T&& value) {
+    // place moved value in buffer and set type discriminator:
+    new(getDerived().getRawBuffer()) T(std::move(value));
+    getDerived().setDiscriminator(Discriminator);
+}
+```
+
+对于：
+
+```c++
+ using VariantChoice<Types, Types...>::VariantChoice...;
+```
+
+是为了将VariantChoice的构造函数变参展开到每个类型上，使得创建对象时，可以用任意数量的参数列表创建。
+
+对于销毁，示例如下：
+
+```c++
+template<typename T, typename... Types>
+bool VariantChoice<T, Types...>::destroy() {
+    if (getDerived().getDiscriminator() == Discriminator) {
+        // if type matches, call placement delete:
+        getDerived().template getBufferAs<T>()->~T();
+        return true;
+    }
+    return false;
+}
+
+<typename... Types>
+void Variant<Types...>::destroy() {
+    // call destroy() on each VariantChoice base class; at most one will succeed:
+    //17中可用折叠表达式替换：(VariantChoice<Types, Types...>::destroy() , ...);
+    bool results[] = {
+    	VariantChoice<Types, Types...>::destroy()...
+    };
+        
+        
+    // indicate that the variant does not store a value
+    this->setDiscriminator(0);
+}
+```
+
+赋值操作如下：
+
+```c++
+template<typename T, typename... Types>
+auto VariantChoice<T, Types...>::operator= (T const& value) -> Derived& {
+    if (getDerived().getDiscriminator() == Discriminator) {
+        // assign new value of same type:
+        *getDerived().template getBufferAs<T>() = value;
+    }
+    else {
+        // assign new value of different type:
+        getDerived().destroy(); // try destroy() for all types
+        new(getDerived().getRawBuffer()) T(value); // place new value
+        getDerived().setDiscriminator(Discriminator);
+    }
+    return getDerived();
+}
+
+template<typename T, typename... Types>
+auto VariantChoice<T, Types...>::operator= (T&& value) -> Derived& {
+    if (getDerived().getDiscriminator() == Discriminator) {
+        // assign new value of same type:
+        *getDerived().template getBufferAs<T>() = std::move(value);
+    }
+    else {
+        // assign new value of different type:
+        getDerived().destroy(); // try destroy() for all types
+        new(getDerived().getRawBuffer()) T(std::move(value)); // place new value
+        getDerived().setDiscriminator(Discriminator);
+    }
+    return getDerived();
+}
+```
+
+## 表达式模板
+
+数字数组类型支持对整个数组对象进行数字操作，可以将两个数组相加，可以将数组整个乘以一个标量。表达式模板可能让人想起模板元编程，元编程对于固定大小的小型数组比较方便，表达式模板对于运行时大小为中型到大型数组的操作非常有效。
+
+### 临时变量和分割循环
+
+基本数组模板可能如下所示：
+
+```c++
+template<typename T>
+class SArray {
+public:
+    // create array with initial size
+    explicit SArray (std::size_t s)
+    : storage(new T[s]), storage_size(s) {
+    	init();
+    }
+
+    // copy constructor
+    SArray (SArray<T> const& orig)
+    : storage(new T[orig.size()]), storage_size(orig.size()) {
+    	copy(orig);
+    }
+
+    // destructor: free memory
+    ~SArray() {
+    	delete[] storage;
+    }
+
+    // assignment operator
+    SArray<T>& operator= (SArray<T> const& orig) {
+        if (&orig!=this) {
+        	copy(orig);
+        }
+        return *this;
+    }
+    // return size
+    std::size_t size() const {
+        return storage_size;
+    }
+
+    // index operator for constants and variables
+    T const& operator[] (std::size_t idx) const {
+        return storage[idx];
+    }
+    T& operator[] (std::size_t idx) {
+        return storage[idx];
+    }
+
+protected:
+    // init values with default constructor
+    void init() {
+        for (std::size_t idx = 0; idx<size(); ++idx) {
+       		storage[idx] = T();
+        }
+    }
+
+    // copy values of another array
+    void copy (SArray<T> const& orig) {
+        assert(size()==orig.size());
+        for (std::size_t idx = 0; idx<size(); ++idx) {
+        	storage[idx] = orig.storage[idx];
+        }
+    }
+
+private:
+    T* storage; // storage of the elements
+    std::size_t storage_size; // number of elements
+};
+    
+template <typename T>
+SArray<T> operator+ (SArray<T> const& a, SArray<T> const& b)
+{
+    assert(a.size()==b.size());
+	SArray<T> result(a.size());
+	for (std::size_t k = 0; k<a.size(); ++k) {
+		result[k] = a[k]+b[k];
+	}
+    return result;
+}
+
+// multiplication of two SArrays
+template<typename T>
+SArray<T> operator* (SArray<T> const& a, SArray<T> const& b)
+{
+    assert(a.size()==b.size());
+	SArray<T> result(a.size());
+	for (std::size_t k = 0; k<a.size(); ++k) {
+		result[k] = a[k]*b[k];
+	}
+    return result;
+}
+
+// multiplication of scalar and SArray
+template<typename T>
+SArray<T> operator* (T const& s, SArray<T> const& a)
+{
+    SArray<T> result(a.size());
+	for (std::size_t k = 0; k<a.size(); ++k) {
+		result[k] = s*a[k];
+	}
+    return result;
+}
+```
+
+由于两个原因这个实现非常低效：
+
+- 操作符的每个应用程序至少创建一个临时数组；
+- 操作符的每个应用程序都需要对参数数组和结果数组进行遍历；
+
+### 模板参数中的编码表达式
+
+举例说明，对于`1.2*x + x*y`，1.2*x的结果不是一个新的数组，而是一个表示x的每个值乘以1.2的对象，其他同理，最终可转换为：
+
+```c++
+A_Add<A_Mult<A_Scalar<double>,Array<double>>,
+	A_Mult<Array<double>,Array<double>>>
+```
+
+为了完成表达式的表示，必须在每个A_Add和A_Mult对象中存储对参数的引用，并记录A_Scale对象的值（或对其的引用），以下是相应操作数的定义：
+
+```c++
+#include <cstddef>
+#include <cassert>
+
+// include helper class traits template to select whether to refer to an
+// expression template node either by value or by reference
+#include "exprops1a.hpp"
+
+// class for objects that represent the addition of two operands
+template<typename T, typename OP1, typename OP2>
+class A_Add {
+private:
+    typename A_Traits<OP1>::ExprRef op1; // first operand
+    typename A_Traits<OP2>::ExprRef op2; // second operand
+
+public:
+    // constructor initializes references to operands
+    A_Add (OP1 const& a, OP2 const& b)
+    : op1(a), op2(b) {
+    }
+
+    // compute sum when value requested
+    T operator[] (std::size_t idx) const {
+    	return op1[idx] + op2[idx];
+    }
+
+    // size is maximum size
+    std::size_t size() const {
+        assert (op1.size()==0 || op2.size()==0
+        	|| op1.size()==op2.size());
+    	return op1.size()!=0 ? op1.size() : op2.size();
+    }
+};
+
+// class for objects that represent the multiplication of two operands
+template<typename T, typename OP1, typename OP2>
+class A_Mult {
+private:
+    typename A_Traits<OP1>::ExprRef op1; // first operand
+    typename A_Traits<OP2>::ExprRef op2; // second operand
+
+public:
+    // constructor initializes references to operands
+    A_Mult (OP1 const& a, OP2 const& b)
+    op1(a), op2(b) {
+    }
+
+    // compute product when value requested
+    T operator[] (std::size_t idx) const {
+    	return op1[idx] * op2[idx];
+    }
+
+    // size is maximum size
+    std::size_t size() const {
+        assert (op1.size()==0 || op2.size()==0
+        	|| op1.size()==op2.size());
+        return op1.size()!=0 ? op1.size() : op2.size();
+    }
+};
+```
+
+对于A_Scalar模板的定义如下：
+
+```c++
+template<typename T>
+class A_Scalar {
+private:
+	T const& s; // value of the scalar
+
+public:
+    // constructor initializes value
+    constexpr A_Scalar (T const& v)
+    : s(v) {
+    }
+
+    // for index operations, the scalar is the value of each element
+    constexpr T const& operator[] (std::size_t) const {
+    	return s;
+    }
+
+    // scalars have zero as size
+    constexpr std::size_t size() const {
+    	return 0;
+    };
+};
+    
+template<typename T> class A_Scalar;
+
+// primary template
+template<typename T>
+class A_Traits {
+public:
+    using ExprRef = T const&; // type to refer to is constant reference
+};
+
+// partial specialization for scalars
+template<typename T>
+class A_Traits<A_Scalar<T>> {
+public:
+	using ExprRef = A_Scalar<T>; // type to refer to is ordinary value
+};
+```
+
+接下来声明Array模板：
+
+```c++
+#include <cstddef>
+#include <cassert>
+#include "sarray1.hpp"
+
+template<typename T, typename Rep = SArray<T>>
+class Array {
+private:
+	Rep expr_rep; // (access to) the data of the array
+
+public:
+    // create array with initial size
+    explicit Array (std::size_t s)
+    : expr_rep(s) {
+    }
+
+    // create array from possible representation
+    Array (Rep const& rb)
+    : expr_rep(rb) {
+    }
+
+    // assignment operator for same type
+    Array& operator= (Array const& b) {
+        assert(size()==b.size());
+        for (std::size_t idx = 0; idx<b.size(); ++idx) {
+            expr_rep[idx] = b[idx];
+        }
+        return *this;
+	}
+
+    // assignment operator for arrays of different type
+    template<typename T2, typename Rep2>
+    Array& operator= (Array<T2, Rep2> const& b) {
+        assert(size()==b.size());
+        for (std::size_t idx = 0; idx<b.size(); ++idx) {
+        	expr_rep[idx] = b[idx];
+        }
+        return *this;
+    }
+
+    // size is size of represented data
+    std::size_t size() const {
+    	return expr_rep.size();
+    }
+
+    // index operator for constants and variables
+    decltype(auto) operator[] (std::size_t idx) const {
+        assert(idx<size());
+        return expr_rep[idx];
+    }
+    T& operator[] (std::size_t idx) {
+        assert(idx<size());
+        return expr_rep[idx];
+    }
+
+    // return what the array currently represents
+    Rep const& rep() const {
+    	return expr_rep;
+    }
+    Rep& rep() {
+    	return expr_rep;
+    }
+};
+```
+
+为了能够计算初始值，我们需要以下操作符：
+
+```c++
+template<typename T, typename R1, typename R2>
+Array<T,A_Add<T,R1,R2>>
+operator+ (Array<T,R1> const& a, Array<T,R2> const& b) {
+    return Array<T,A_Add<T,R1,R2>>
+    	(A_Add<T,R1,R2>(a.rep(),b.rep()));
+}
+
+// multiplication of two Arrays:
+template<typename T, typename R1, typename R2>
+Array<T, A_Mult<T,R1,R2>>
+operator* (Array<T,R1> const& a, Array<T,R2> const& b) {
+    return Array<T,A_Mult<T,R1,R2>>
+    	(A_Mult<T,R1,R2>(a.rep(), b.rep()));
+}
+
+// multiplication of scalar and Array:
+template<typename T, typename R2>
+Array<T, A_Mult<T,A_Scalar<T>,R2>>
+operator* (T const& s, Array<T,R2> const& b) {
+    return Array<T,A_Mult<T,A_Scalar<T>,R2>>
+    	(A_Mult<T,A_Scalar<T>,R2>(A_Scalar<T>(s), b.rep()));
+}
+
+// multiplication of Array and scalar, addition of scalar and Array
+// addition of Array and scalar:
+...
+```
+
+## 调试模板
+
+### 浅式实例化
+
+比如我们想要判断能不能对T::Index类型的值解引用，可以这样做：
+
+```c++
+template<typename T>
+void ignore(T const&)
+{ }
+
+template<typename T>
+void shell (T const& env)
+{
+    class ShallowChecks
+    {
+        void deref(typename T::Index ptr) {
+        	ignore(*ptr);
+    	}
+    };
+    typename T::Index i;
+    middle(i);
+}
+```
+
+若T是不能解引用T::Index的类型，则在局部类ShallowChecks上出现编译错误，但许多编译期会警告没有使用ShallowChecks，可以使用ignore模板等技巧来抑制此类警告，但会增加代码复杂度。
+
+### 静态断言
+
+11中引入的static_assert关键字会在编译时进行求值，若条件为false编译器会报错。
+
+### 原型
+
+原型是用户定义的类，可以用作模板参数来测试模板定义是否遵守其对相应模板参数施加的约束。模板是定制的，以满足模板的需求而不提供任何无关操作。若将原型作为模板参数的模板定义实例化成功，那就知道模板定义不会尝试使用模板没有明确要求的其他操作。下面是一个原型，用以满足find算法中描述的EqualityComparable概念需求：
+
+```c++
+class EqualityComparableArchetype {};
+class ConvertibleToBoolArchetype
+{
+public:
+	operator bool() const;
+};
+
+ConvertibleToBoolArchetype
+operator==(EqualityComparableArchetype const&,
+	EqualityComparableArchetype const&);
+
+```
+
+EquailityComparableArchetype没有成员函数或数据，可以提供的唯一操作是重载operator==，以满足find的相等性要求。operator==返回另一个原型ConvertibleToBoolArchetype，其定义的唯一操作是用户定义的到bool的转换。可以通过拿EquailityComparableArchetype实例化find来检查约束。
+
+### 跟踪
+
+跟踪程序是用户定义的一个类，可以用作要测试模板的参数，其也是一个原型，只是为了满足模板的需求。跟踪程序应该生成对其调用操作的跟踪，可以通过实验验证算法的效率以及操作的顺序。注意，17之前必须在翻译单元中在类声明之外初始化静态成员。一个排序算法跟踪器的例子如下：
+
+```c++
+#include <iostream>
+class SortTracer {
+private:
+    int value; // integer value to be sorted
+    int generation; // generation of this tracer
+    inline static long n_created = 0; // number of constructor calls
+    inline static long n_destroyed = 0; // number of destructor calls
+    inline static long n_assigned = 0; // number of assignments
+    inline static long n_compared = 0; // number of comparisons
+    inline static long n_max_live = 0; // maximum of existing objects
+
+    // recompute maximum of existing objects
+    static void update_max_live() {
+        if (n_created-n_destroyed > n_max_live) {
+        	n_max_live = n_created-n_destroyed;
+        }
+    }
+
+public:
+    static long creations() {
+    	return n_created;
+	}
+    static long destructions() {
+    	return n_destroyed;
+    }
+    static long assignments() {
+    	return n_assigned;
+    }
+    static long comparisons() {
+    	return n_compared;
+    }
+    static long max_live() {
+    	return n_max_live;
+    }
+
+public:
+    // constructor
+    SortTracer (int v = 0) : value(v), generation(1) {
+        ++n_created;
+        update_max_live();
+        std::cerr << "SortTracer #" << n_created
+        << ", created generation " << generation
+        << " (total: " << n_created - n_destroyed
+        << ")\n";
+    }
+
+    // copy constructor
+    SortTracer (SortTracer const& b)
+    : value(b.value), generation(b.generation+1) {
+        ++n_created;
+        update_max_live();
+        std::cerr << "SortTracer #" << n_created
+        << ", copied as generation " << generation
+        << " (total: " << n_created - n_destroyed
+        << ")\n";
+    }
+
+     // destructor
+     ~SortTracer() {
+         ++n_destroyed;
+         update_max_live();
+         std::cerr << "SortTracer generation " << generation
+         << " destroyed (total: "
+         << n_created - n_destroyed << ")\n";
+     }
+
+     // assignment
+     SortTracer& operator= (SortTracer const& b) {
+         ++n_assigned;
+         std::cerr << "SortTracer assignment #" << n_assigned
+         " << generation
+         << " = " << b.generation
+         << ")\n";
+         value = b.value;
+         return *this;
+     }
+
+     // comparison
+     friend bool operator < (SortTracer const& a,
+     SortTracer const& b) {
+         ++n_compared;
+         std::cerr << "SortTracer comparison #" << n_compared
+         << " (generation " << a.generation
+         << " < " << b.generation
+         << ")\n";
+         return a.value < b.value;
+     }
+
+     int val() const {
+     	return value;
+     }
+};
+```
 
