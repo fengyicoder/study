@@ -20,7 +20,7 @@ CPUPROFILE=prof.data ./example
 最重要的是编译时链接profiler，但这段示例并不能生成prof.data，原因在于程序中没有真正使用profiler，所以编译器根本没有链接profiler，一种方式在程序中直接调用ProfilerStart(filename)和ProfilerStop()，强制使用这个库，另一种方法是强制链接器不剔除未引用的库，修改如下：
 
 ```shell
- g++ substring_sort.c -Wl,--no-as-needed,-lprofiler -o example
+ g++ substring_sort.c -Wl,--no-as-needed,-lprofiler,--as-needed -g -o example
  CPUPROFILE=prof.data ./example
 ```
 
@@ -592,3 +592,774 @@ template <typename T> struct Wrapper {
 
 ### 线程安全的数据结构
 
+高性能的一个原则，不做总是比做要快，我们现在要使用多个线程来搜索共享数据，如果找到一个，则原子计数加一，这其实性能也有些差，最好在每个线程上保持本地计数，并且只增加共享计数一次：
+
+```c++
+unsigned long count;
+std::mutex M; // Guards count
+…
+// On each thread
+unsigned long local_count = 0;
+for ( … counting loop … ) {
+    … search …
+    if (… found …) ++local_count;
+}
+std::lock_guard<std::mutex> L(M);
+count += local_count;
+```
+
+当然，最好的线程安全是不需要多个线程访问共享数据。
+
+### 线程安全的堆栈
+
+所有的C++容器都提供了弱线程安全，多个线程可以安全的访问只读容器，只要没有线程调用非const函数。
+
+我们可以用自己的类来包装堆栈类，只要别忘记使用互斥锁保护临界区。我们可以使用继承而不是封装，这样会使得我们的包装类更简单，但使用公共继承会公开基类stack的每个成员函数，如果忘记包装一个，代码会有风险。私有（或受保护）的继承避免了这个问题，但会带来其他风险，有些构造函数需要重新实现，比如移动构造函数需要锁定正在移动的堆栈，所以需要自定义实现。
+
+```c++
+template <typename T> void reset(T& s) { T().swap(s); }
+
+template <typename T> class mt_stack
+{
+    std::deque<T> s_;
+    mutable spinlock l_;
+    int cap_ = 0;
+    struct counts_t { 
+        int pc_ = 0; // Producer count
+        int cc_ = 0; // Consumer count
+        bool equal(std::atomic<counts_t>& n) {
+            if (pc_ == cc_) return true;
+            *this = n.load(std::memory_order_relaxed);
+            return false;
+        }
+    };
+    mutable std::atomic<counts_t> n_;
+    public:
+    mt_stack(size_t n = 100000000) : s_(n), cap_(n) {}
+    void push(const T& v) {
+        // Reserve the slot for the new object by advancing the producer count.
+        counts_t n = n_.load(std::memory_order_relaxed);
+        if (n.pc_ == cap_) abort();
+        int i = 0;
+        while (!n.equal(n_) || !n_.compare_exchange_weak(n, {n.pc_ + 1, n.cc_}, std::memory_order_acquire, std::memory_order_relaxed)) {
+            if (n.pc_ == cap_) abort();
+            nanosleep(i);
+        };
+        // Producer count advanced, slot n.pc_ + 1 is ours.
+        ++n.pc_;
+        new (&s_[n.pc_]) T(v);
+
+        // Advance the consumer count to match.
+        if (!n_.compare_exchange_strong(n, {n.pc_, n.cc_ + 1}, std::memory_order_release, std::memory_order_relaxed)) abort();
+    }
+    std::optional<T> pop() {
+        // Decrement the consumer count.
+        counts_t n = n_.load(std::memory_order_relaxed);
+        if (n.cc_ == 0) return std::optional<T>(std::nullopt);
+        int i = 0;
+        while (!n.equal(n_) || !n_.compare_exchange_weak(n, {n.pc_, n.cc_ - 1}, std::memory_order_acquire, std::memory_order_relaxed)) { 
+            if (n.cc_ == 0) return std::optional<T>(std::nullopt);
+            nanosleep(i);
+        };
+        // Consumer count decremented, slot n.cc_ - 1 is ours.
+        --n.cc_;
+        std::optional<T> res(std::move(s_[n.pc_]));
+        s_[n.pc_].~T();
+
+        // Decrement the producer count to match.
+        if (!n_.compare_exchange_strong(n, {n.pc_ - 1, n.cc_}, std::memory_order_release, std::memory_order_relaxed)) abort();
+        return res;
+    }
+    std::optional<T> top() const {
+        // Decrement the consumer count.
+        counts_t n = n_.load(std::memory_order_relaxed);
+        if (n.cc_ == 0) return std::optional<T>(std::nullopt);
+        int i = 0;
+        while (!n.equal(n_) || !n_.compare_exchange_weak(n, {n.pc_, n.cc_ - 1}, std::memory_order_acquire, std::memory_order_relaxed)) { 
+            if (n.cc_ == 0) return std::optional<T>(std::nullopt);
+            nanosleep(i);
+        };
+        // Consumer count decremented, slot n.cc_ - 1 is ours.
+        --n.cc_;
+        std::optional<T> res(std::move(s_[n.pc_]));
+
+        // Restore the consumer count.
+        if (!n_.compare_exchange_strong(n, {n.pc_, n.cc_ + 1}, std::memory_order_release, std::memory_order_relaxed)) abort();
+        return res;
+    }
+    void reset() { ::reset(s_); s_.resize(cap_); }
+};
+```
+
+注意，我们没有使用std::stack，因为它在线程之间共享，对它的push和pop没有锁定就意味着不是线程安全的，为了简单，这里使用了deque，并构造了足够多的元素。
+
+### 线程安全的队列
+
+队列跟堆栈不一样，只要队列非空，生产者消费者就不会交互，push不需要知道头部的索引，pop不关心队尾的索引。我们首先考虑将这些角色分配给不同线程的场景，进一步简化使用每一种线程的方式，我们现在考虑一个生产者和一个消费者。因为只有一个生产者，不需要为这个索引使用原子整数，只有队列为空时两个线程才会交互，为此需要一个原子变量表示队列的大小，消费者与之相反。
+
+在内存的处理上，对上文的堆栈我们假设意志最大容量，并且不会超过，对于队列来说就不行了，因为前后的索引都会移动，这里的解决方法是将数组视为循环缓冲区，并对数组下标使用取模运算：
+
+```c++
+struct LS {
+    long x[1024];
+    LS(char i) { for (size_t k = 0; k < 1024; ++k) x[k] = i; }
+};
+
+template <typename T> class pc_queue {
+  public:
+  explicit pc_queue(size_t capacity) : 
+    capacity_(capacity), data_(static_cast<T*>(::malloc(sizeof(T)*capacity_))) {}
+  ~pc_queue() { ::free(data_); }
+  bool push(const T& v) {
+    if (size_.load(std::memory_order_relaxed) == capacity_) return false;
+    new (data_ + (back_ % capacity_)) T(v);
+    ++back_;
+    size_.fetch_add(1, std::memory_order_release);
+    return true;
+  }
+  std::optional<T> pop() {
+    if (size_.load(std::memory_order_acquire) == 0) {
+      return std::optional<T>(std::nullopt);
+    } else {
+      std::optional<T> res(std::move(data_[front_ % capacity_]));
+      data_[front_ % capacity_].~T();
+      ++front_;
+      size_.fetch_sub(1, std::memory_order_relaxed);
+      return res;
+    }
+  }
+
+  void reset() { size_ = front_ = back_ = 0; }
+  private:
+  const size_t capacity_;
+  T* const data_;
+  size_t front_ = 0;
+  size_t back_ = 0;
+  std::atomic<size_t> size_;
+};
+```
+
+如果对于多个生产者和消费者，那么通用的方案使用与堆栈相同的技术，将front和back索引打包到一个64位原子类型中，并以比较-交换原子方式访问。
+
+如果放弃队列的顺序一致性（即入队的顺序和出队的顺序相同），可以开发出一种全新的方法：可以有几个单线程子队列，而非单个线程安全队列，每个线程必须以原子的方式获得子队列中的所有权。最简单的方法是使用指向子队列的原子指针数组。为了获得该队列的所有权同时防止其他线程访问该队列，需要将子队列指针自动交换为空。
+
+![7-22](..\image\the-art-of-writing-effective-program\7-22.png)
+需要访问队列的线程必须获得一个子队列，可以从指针数组的任何元素开始。如果为空则该子队列当前处于繁忙状态，然后尝试下一个元素。操作完成后线程原子性的将子队列指针写回数组，将子队列的所有权返回给队列：
+
+```c++
+// Circular queue of a fixed size.
+// This class is not thread-safe, it is supposed to be manipulated by one
+// thread at a time.
+template <typename T> class subqueue {
+    public:
+    explicit subqueue(size_t capacity) : capacity_(capacity), begin_(0), size_(0) {}
+    size_t capacity() const { return capacity_; }
+    size_t size() const { return size_; }
+    bool push(const T& x) {
+        if (size_ == capacity_) return false;
+        size_t end = begin_ + size_++;
+        if (end >= capacity_) end -= capacity_;
+        data_[end] = x;
+        return true;
+    }
+    bool pop(std::optional<T>& x) {
+        if (size_ == 0) return false;
+        --size_;
+        size_t pos = begin_;
+        if (++begin_ == capacity_) begin_ -= capacity_;
+        x.emplace(std::move(data_[pos]));
+        data_[pos].~T();
+        return true;
+    }
+    static size_t memsize(size_t capacity) {
+        return sizeof(subqueue) + capacity*sizeof(T);
+    }
+    static subqueue* construct(size_t capacity) {
+        return new(::malloc(subqueue::memsize(capacity))) subqueue(capacity);
+    }
+    static void destroy(subqueue* queue) {
+        queue->~subqueue();
+        ::free(queue);
+    }
+    void reset() { 
+        begin_ = size_ = 0;
+    }
+
+    private:
+    const size_t capacity_;
+    size_t begin_;
+    size_t size_;
+    T data_[1]; // Actually [capacity_]
+};
+
+// Collection of several subqueues, for optimizing of concurrent access.
+// Each queue pointer is on a separate cache line.
+template <typename Q> struct subqueue_ptr {
+  subqueue_ptr() : queue() {}
+  std::atomic<Q*> queue;
+  char padding[64 - sizeof(queue)]; // Padding to cache line
+};
+
+template <typename T> class concurrent_queue {
+  typedef subqueue<T> subqueue_t;
+  typedef subqueue_ptr<subqueue_t> subqueue_ptr_t;
+  public:
+    explicit concurrent_queue(size_t capacity = 1UL << 15) {
+      for (int i = 0; i < QUEUE_COUNT; ++i) {
+        queues_[i].queue.store(subqueue_t::construct(capacity), std::memory_order_relaxed);
+      }
+    }
+    ~concurrent_queue() {
+      for (int i = 0; i < QUEUE_COUNT; ++i) {
+        subqueue_t* queue = queues_[i].queue.exchange(nullptr, std::memory_order_relaxed);
+        subqueue_t::destroy(queue);
+      }
+    }
+
+    // How many entries are in the queue?
+    size_t size() const { return count_.load(std::memory_order_acquire); }
+
+    // Is the queue empty?
+    bool empty() const { return size() == 0; }
+
+    // Get an element from the queue.
+    // This method blocks until either the queue is empty (size() == 0) or an
+    // element is returned from one of the subqueues.
+    std::optional<T> pop() {
+      std::optional<T> res;
+      if (count_.load(std::memory_order_acquire) == 0) {
+        return res;
+      }
+      // Take ownership of a subqueue. The subqueue pointer is reset to NULL
+      // while the calling thread owns the subqueue. When done, relinquish
+      // the ownership by restoring the pointer.  The subqueue we got may be
+      // empty, but this does not mean that we have no entries: we must check
+      // other queues. We can exit the loop when we got an element or the element
+      // count shows that we have no entries.
+      // Note that decrementing the count is not atomic with dequeueing the
+      // entries, so we might spin on empty queues for a little while until the
+      // count catches up.
+      subqueue_t* queue = NULL;
+      bool success = false;
+      for (size_t i = 0; ;)
+      {
+        i = dequeue_slot_.fetch_add(1, std::memory_order_relaxed) & (QUEUE_COUNT - 1);
+        queue = queues_[i].queue.exchange(nullptr, std::memory_order_acquire);  // Take ownership of the subqueue
+        if (queue) {
+          success = queue->pop(res);                                            // Dequeue element while we own the queue
+          queues_[i].queue.store(queue, std::memory_order_release);             // Relinquish ownership
+          if (success) break;                                                   // We have an element
+          if (count_.load(std::memory_order_acquire) == 0) goto EMPTY;          // No element, and no more left
+        } else {                                                                // queue is NULL, nothing to relinquish
+          if (count_.load(std::memory_order_acquire) == 0) goto EMPTY;          // We failed to get a queue but there are no more entries left
+        }
+        if (success) break;
+        if (count_.load(std::memory_order_acquire) == 0) goto EMPTY;
+        static const struct timespec ns = { 0, 1 };
+        nanosleep(&ns, NULL);
+      };
+      // If we have an element, decrement the queued element count.
+      count_.fetch_add(-1);
+EMPTY:
+      return success;
+    }
+
+    // Add an element to the queue.
+    // This method blocks until either the queue is full or an element is added to
+    // one of the subqueues. Note that the "queue is full" condition cannot be
+    // checked atomically for all subqueues, so it's approximate, we try
+    // several subqueues, if they are all full we give up.
+    bool push(const T& v) {
+      // Preemptively increment the element count: get() will spin on subqueues
+      // as long as it thinks there is an element to dequeue, but it will exit as
+      // soon as the count is zero, so we want to avoid the situation when we
+      // added an element to a subqueue, have not incremented the count yet, but
+      // get() exited with no element. If this were to happen, the pool could be
+      // deleted with entries still in the queue.
+      count_.fetch_add(1);
+      // Take ownership of a subqueue. The subqueue pointer is reset to NULL
+      // while the calling thread owns the subqueue. When done, relinquish
+      // the ownership by restoring the pointer.  The subqueue we got may be
+      // full, in which case we try another subqueue, but don't loop forever
+      // if all subqueues keep coming up full.
+      subqueue_t* queue = NULL;
+      bool success = false;
+      int full_count = 0;                                             // How many subqueues we tried and found full
+      //for (size_t enqueue_slot = 0, i = 0; ;)
+      for (size_t i = 0; ;)
+      {
+        //i = ++enqueue_slot & (QUEUE_COUNT - 1);
+        i = enqueue_slot_.fetch_add(1, std::memory_order_relaxed) & (QUEUE_COUNT - 1);
+        queue = queues_[i].queue.exchange(nullptr, std::memory_order_acquire);    // Take ownership of the subqueue
+        if (queue) {
+          success = queue->push(v);                                               // Enqueue element while we own the queue
+          queues_[i].queue.store(queue, std::memory_order_release);               // Relinquish ownership
+          if (success) return success;                                            // We added the element
+          if (++full_count == QUEUE_COUNT) break;                                 // We tried hard enough, probably queue is full
+        }
+        static const struct timespec ns = { 0, 1 };
+        nanosleep(&ns, NULL);
+      };
+      // If we added the element, the count is already incremented. Otherwise,
+      // we must decrement the count now.
+      count_.fetch_add(-1);
+      return success;
+    }
+
+  void reset() { 
+    count_ = enqueue_slot_ = dequeue_slot_ = 0;
+    for (int i = 0; i < QUEUE_COUNT; ++i) {
+      subqueue_t* queue = queues_[i].queue;
+      queue->reset();
+    }
+  }
+
+  private:
+    enum { QUEUE_COUNT = 16 };
+    subqueue_ptr_t queues_[QUEUE_COUNT];
+    std::atomic<int> count_;
+    std::atomic<size_t> enqueue_slot_;
+    std::atomic<size_t> dequeue_slot_;
+};
+
+template <typename T> class concurrent_std_queue {
+  using subqueue_t = std::queue<T>;
+  struct subqueue_ptr_t {
+    subqueue_ptr_t() : queue() {}
+    std::atomic<subqueue_t*> queue;
+    char padding[64 - sizeof(queue)]; // Padding to cache line
+  };
+
+  public:
+    explicit concurrent_std_queue() {
+      for (int i = 0; i < QUEUE_COUNT; ++i) {
+        queues_[i].queue.store(new subqueue_t, std::memory_order_relaxed);
+      }
+    }
+    ~concurrent_std_queue() {
+      for (int i = 0; i < QUEUE_COUNT; ++i) {
+        subqueue_t* queue = queues_[i].queue.exchange(nullptr, std::memory_order_relaxed);
+        delete queue;
+      }
+    }
+
+    // How many entries are in the queue?
+    size_t size() const { return count_.load(std::memory_order_acquire); }
+
+    // Is the queue empty?
+    bool empty() const { return size() == 0; }
+
+    // Get an element from the queue.
+    // This method blocks until either the queue is empty (size() == 0) or an
+    // element is returned from one of the subqueues.
+    std::optional<T> pop() {
+      std::optional<T> res;
+      if (count_.load(std::memory_order_acquire) == 0) {
+        return res;
+      }
+      // Take ownership of a subqueue. The subqueue pointer is reset to NULL
+      // while the calling thread owns the subqueue. When done, relinquish
+      // the ownership by restoring the pointer.  The subqueue we got may be
+      // empty, but this does not mean that we have no entries: we must check
+      // other queues. We can exit the loop when we got a element or the element
+      // count shows that we have no elements.
+      // Note that decrementing the count is not atomic with dequeueing the
+      // entries, so we might spin on empty queues for a little while until the
+      // count catches up.
+      subqueue_t* queue = NULL;
+      bool success = false;
+      for (size_t i = 0; ;)
+      {
+        i = dequeue_slot_.fetch_add(1, std::memory_order_relaxed) & (QUEUE_COUNT - 1);
+        queue = queues_[i].queue.exchange(nullptr, std::memory_order_acquire);  // Take ownership of the subqueue
+        if (queue) {
+          if (!queue->empty()) {                                                // Dequeue element while we own the queue
+            success = true;
+            res.emplace(std::move(queue->front()));
+            queue->pop();
+            queues_[i].queue.store(queue, std::memory_order_release);           // Relinquish ownership
+            break;                                                              // We have an element
+          } else {                                                              // Subqueue is empty, try the next one
+            queues_[i].queue.store(queue, std::memory_order_release);           // Relinquish ownership
+            if (count_.load(std::memory_order_acquire) == 0) goto EMPTY;        // No element, and no more left
+          }
+        } else {                                                                // queue is NULL, nothing to relinquish
+          if (count_.load(std::memory_order_acquire) == 0) goto EMPTY;          // We failed to get a queue but there are no more entries left
+        }
+        if (success) break;
+        if (count_.load(std::memory_order_acquire) == 0) break; 
+        static const struct timespec ns = { 0, 1 };
+        nanosleep(&ns, NULL);
+      };
+      // If we have an element, decrement the queued element count.
+      count_.fetch_add(-1);
+EMPTY:
+      return res;
+  }
+
+  // Add an element to the queue.
+  // This method blocks until either the queue is full or an element is added to
+  // one of the subqueues. Note that the "queue is full" condition cannot be
+  // checked atomically for all subqueues, so it's approximate, we try
+  // several subqueues, if they are all full we give up.
+  bool push(const T& v) {
+    // Preemptively increment the element count: get() will spin on subqueues
+    // as long as it thinks there is an element to dequeue, but it will exit as
+    // soon as the count is zero, so we want to avoid the situation when we
+    // added an element to a subqueue, have not incremented the count yet, but
+    // get() exited with no element. If this were to happen, the pool could be
+    // deleted with entries still in the queue.
+    count_.fetch_add(1);
+    // Take ownership of a subqueue. The subqueue pointer is reset to NULL
+    // while the calling thread owns the subqueue. When done, relinquish
+    // the ownership by restoring the pointer.  The subqueue we got may be
+    // full, in which case we try another subqueue, but don't loop forever
+    // if all subqueues keep coming up full.
+    subqueue_t* queue = NULL;
+    bool success = false;
+    for (size_t i = 0; ;)
+    {
+      i = enqueue_slot_.fetch_add(1, std::memory_order_relaxed) & (QUEUE_COUNT - 1);
+      queue = queues_[i].queue.exchange(nullptr, std::memory_order_acquire);    // Take ownership of the subqueue 
+      if (queue) {
+        success = true;
+        queue->push(v);                                                         // Enqueue element while we own the queue 
+        queues_[i].queue.store(queue, std::memory_order_release);               // Relinquish ownership
+        return success;
+      }
+      static const struct timespec ns = { 0, 1 };
+      nanosleep(&ns, NULL);
+    };
+    return success;
+  }
+
+  void reset() { 
+    count_ = enqueue_slot_ = dequeue_slot_ = 0;
+    for (int i = 0; i < QUEUE_COUNT; ++i) {
+      subqueue_t* queue = queues_[i].queue;
+      subqueue_t().swap(*queue);
+    }
+  }
+
+  private:
+  enum { QUEUE_COUNT = 16 };
+  subqueue_ptr_t queues_[QUEUE_COUNT];
+  std::atomic<int> count_;
+  std::atomic<size_t> enqueue_slot_;
+  std::atomic<size_t> dequeue_slot_;
+};
+```
+
+对于并发数据结构的内存管理，当需要无锁数据结构时，可以估计其最大容量并预分配内存，如果需要增加内存，最理想的情况是添加内存但不复制现有数据结构，就像deque一样，当需要更多内存时会分配另一个内存块，通常会有一些指针地址的修改。为了防止多个线程在设置等待标志之前同时检测内存不足的情况，这通常会导致竞争，可以使用双重检查锁，它同时使用互斥锁和原子标志，如果标志没有设置，则一切正常，如果设置标志，则必须获取锁，并再次检查该标志：
+
+```c++
+std::atomic<int> wait;  // 1 if managing memory
+std::mutex lock;
+while (wait == 1) {};  // Memory allocation in progress
+if ( … out of memory … ) {
+    std::lock_guard g(lock);
+    if (… out of memory …) { // We got here first!
+    wait = 1;
+    … allocate more memory …
+    wait = 0;
+    }
+}
+… do the operation normally …
+```
+
+### 线程安全的链表
+
+有一种非常常见的故障A-B-A问题，如下所示：
+
+![7-27](..\image\the-art-of-writing-effective-program\7-27.png)
+
+假设线程A要删除第一个节点，所以其保存了第二个节点作为头节点，现在线程B开始运行，删除了前两个节点又新增了一个节点，这个时候这个新节点大概率重用了原来第一个节点的地址，现在A又开始运行，进行比较和交换操作，发现第一个节点地址不变因此操作成功，现在头节点指向了T2以前使用的内存，出错了。这种问题的根源在于，如果内存回收和分配，那么内存中的指针或地址就不能作为数据的唯一标识。所以必须确保在读取一个将会比较-交换使用的指针时，在比较交换完成之前该地址的内存不能释放。这都属于延迟内存回收，一种是垃圾收集，另一种是使用风险指针。本书介绍的则是一种使用原子共享指针的方法。
+
+## C++中的并发
+
+### C++17的并发支持
+
+除了添加了std::scoped_lock和std::shared_mutex之外，还允许决定L1缓存的缓存行大小，std::hardware_destructive_interference_size和std::hardware_constructive_interference_size。另外还有了一些并行算法。
+
+### C++20的并发支持
+
+协程具有中断和恢复功能的线程。协同程序有两种风格：有栈和无栈。
+
+假设在f()里面调用了g()，则其栈帧如下所示：
+
+![8-5](..\image\the-art-of-writing-effective-program\8-5.png)
+
+无栈协程的状态存储在堆上，这种分配称为活帧，活帧与协程句柄相关联，协程句柄是一个智能指针的对象，可以发出和返回函数的调用，只要句柄没有损害，活帧就一直存在。协程还需要堆栈空间调用其他函数，该空间在调用者的堆栈上分配。
+
+20中协程的主要内容有：
+
+- 协程是可以挂起自己的函数，且这个操作是由开发者显式完成的；
+- 与栈帧相关联的常规函数不同，协程具有句柄对象，只要句柄处于活动状态，协程状态就会保持；
+- 协程挂起后，控制权将返回给调用者，调用者可以继续以相同的方式运行；
+- 协程可以从任何位置恢复，不一定是调用者本身，此外协程甚至可以从不同的线程恢复。
+
+## 高性能C++
+
+### 不必要的复制
+
+在类的构造函数中有时候必须存储数据的副本，可以如下操作：
+
+```c++
+class C {
+	std::vector<int> v_;
+	C(const std::vector<int>& v) : v_(v) { … }
+	C(std::vector<int>&& v) : v_(std::move(v)) { … }
+};
+
+```
+
+缺点就是需要编写两个构造函数，另一种方法是按值传递所有参数并移动参数：
+
+```c++
+class C {
+    std::vector<int> v_;
+    C(std::vector<int> v) : v_(std::move(v))
+    { … do not use v here!!! … }
+};
+
+```
+
+返回值优化（RVO）是一种特殊的优化。通常编译器可以对程序做任何事情，只要不改变可观察对象的行为，可观察行为包括输入、输出以及访问易失性存储器。但是RVO导致了一个可观察的变化，复制构造函数和匹配的析构函数的预期输出不见了，实际上这是一个例外：编译器允许消除复制或移动构造函数和相应析构函数的调用，即使这些函数有包含可观察行为的副作用，而且这个例外不局限于RVO。通常不能仅仅因为编写了一些似乎在进行复制的代码，就指望调用复制和移动构造函数，这就是所谓的忽略复制。另外，只是一种优化，代码必须先编译然后才能优化，因此，如果删除了复制和移动构造函数就可能编译报错。
+
+```c++
+ C makeC(int i) { return C(i); }
+```
+
+这段代码在17中可以很好的编译，原因在于未命名RVO自动17之后是强制性的，标准规定一开始就不要求复制或移动。注意返回一个显式的移动将禁用RVO，这个时候返回值如果显式的调用std::move，要么获得一个移动要么会进行复制。这种情况下如果删除了移动构造函数而没有删除复制构造函数会发生什么。需要注意的是，声明一个已删除的成员函数与不声明任何成员函数是不同的，如果编译器对移动构造函数执行重载解析，将找到一个移动构造函数（即使这个构造函数被删除了）。编译失败的原因在于重载解析选择一个已删除的函数作为最佳的重载。如果想强制使用复制构造函数，就不必声明任何移动构造函数。
+
+当然我们也可以使用指针来避免复制，为了不用管理生命周期，最佳方案是返回智能指针，比如：
+
+```c++
+std::unique_ptr<C> makeC(int i) {
+	return std::make_unique<C>(i);
+}
+```
+
+这样的工厂函数应该返回唯一指针，即使想要共享指针来管理，从唯一指针移动到共享指针的成本也很低。
+
+### 低效的内存管理
+
+从基准测试可以看出，分配内存很消耗性能，因此如果预先知道最大内存，可以在开始预留内存。如果事先不知道内存大小，可以使用仅增长的缓存区来处理，比如：
+
+```c++
+class Buffer {
+    size_t size_;
+    std::unique_ptr<char[]> buf_;
+public:
+    explicit Buffer(size_t N) : size_(N), buf_(
+    new char[N]) {}
+    void resize(size_t N) {
+        if (N <= size_) return;
+        char* new_buf = new char[N];
+        memcpy(new_buf, get(), size_);
+        buf_.reset(new_buf);
+        size_ = N;
+    }
+    char* get() { return &buf_[0]; }
+};
+```
+
+只增长的缓冲区比固定大小的缓冲区慢，但比每次分配和回收内存都会快很多。
+
+在并发程序中，内存分配更加低效，如果多个线程同时分配和释放内存，那么内部数据的管理必须由锁来保护，这是一个全局锁，因此如果经常调用分配器，会限制整个程序的扩展性。最常见的解决方案是使用带有线程局部缓存的分配器，比如流行的malloc替换库TCMalloc。这些分配器为每个线程预留了一定数量的内存，当一个线程需要分配内存时，首先从线程本地内存域中获取并分配，释放时内存会添加到线程特定域中，不需要任何锁。
+
+对于内存碎片，一种解决方法是块分配器，比如所有内存都以固定大小的块（比如64kb）分配。
+
+### 条件执行的优化
+
+注意只有当分析器显示出较差的分支预测时才应该进行条件执行的优化。比如，手动优化这段代码几乎没什么用：
+
+```c++
+int f(int x) { return (x > 0) ? x : 0; }
+```
+
+原因在于大多数编译器不会使用条件跳转来实现这一行，在x86上，一些编译器使用CMOVE指令，根据条件，将值从两个源寄存器之一移动到目标寄存器。另一个不太可能优化的是条件函数调用：
+
+```c++
+if (condition) f1(… args …) else f2(… args …);
+```
+
+无分支实现可以使用函数指针数组：
+
+```c++
+using func_ptr = int(*)(… params …);
+static const func_ptr f[2] = { &f1, &f2 };
+(*f[condition])(… args …);
+```
+
+但如果函数最初是内联的，那么用间接函数调用替换会影响性能。编译期间跳转到另一个地址未知的函数，其效果类似于错误的预测分支，所以这段代码会使得CPU刷新流水线。
+
+## C++中的编译器优化
+
+### 翻译器优化代码
+
+对于翻译器优化代码：
+
+- 非内联函数会破坏大多数优化，因为编译器必须假设一个函数，但没有看到具体的代码，所以可以做任何合法的事情；
+- 全局变量和共享变量对于优化有害；
+- 编译器更可能优化短而简单的代码，而不是长而复杂的代码；
+
+编译器的大多数优化都局限于基本代码块，这些块只有一个入口点和一个出口点，在程序的流控制图中充当节点。基本块之所以重要，是因为编译器可以看到块内发生的一切，因此可以对不改变输出的代码转换进行推理，所以内联的优点是它增加了基本块的大小。
+
+对于内联函数，当使用函数体的副本替换函数调用时，将由编译器执行。为了实现这一点，内联函数的定义必须在调用代码的编译过程中可见，调用的函数必须在编译时已知。第一个要求在进行全程序优化的编译器中是宽松的，第二个要求排除虚函数调用和通过函数指针间接调用，并不是每个可以内联的函数最终都可以内联，编译器必须权衡代码膨胀和内联带来的好处。C++的inline关键字只是建议，编译器可以忽视。
+
+函数调用内联最明显的好处是消除了函数调用的成本，大多数情况下函数调用的开销并不大。主要的好处是编译器在函数调用中可以做的优化非常受限。内联对优化影响的关键在于，内联允许编译器看到在本来神秘的函数中没有发生的事情，比如空的析构函数。内联还有另一个重要作用，创建内联函数体的唯一副本，可以使用调用者给出的特定输入进行优化。
+
+```c++
+bool pred(int i) { return i == 0; }
+…
+std::vector<int> v = … fill vector with data …;
+auto it = std::find_if(v.begin(), v.end(), pred);
+```
+
+假设pred的定义和find_if的调用在同一个编译单元，对pred的调用是否内联？答案是可能，取决于find_if是否内联。现在find_if是模板，如果find_if没有内联，则会从模板中为特定类型生成一个函数，这个函数中第三个实参是一个函数指针，但这个指针在编译时未知，同一个find_if可以用许多不同的谓词来调用，这些谓词都不能是内联的。只有编译器为这个特定的调用生成唯一的find_if副本时，谓词函数才能内联，编译器有时会这么做，但在大多数情况下，内联谓词作为参数传入的其他内部函数的唯一方法是首先外联外部函数。
+
+```c++
+bool pred(int i) { return i == 0; }
+…
+std::vector<int> v = … fill vector with data …;
+auto it = std::find_if(v.begin(), v.end(),
+[&](int i) { return pred(i); });
+
+```
+
+这段代码中，pred反而更容易内联，因为这一次谓词的类型是唯一的。
+
+有时候我们可以帮助编译器确定一些信息，比如：
+
+```c++
+//优化前
+template <typename T>
+int f(const std::vector<int>& v, const T& b) {
+    int sum = 0;
+    for (int a: v) {
+    	if (b) sum += g(a);
+    }
+    return sum;
+}
+
+//优化后
+template <typename T>
+int f(const std::vector<int>& v, const T& t) {
+    const bool b = bool(t);
+    int sum = 0;
+    for (int a: v) {
+    	if (b) sum += g(a);
+    }
+    return sum;
+}
+
+```
+
+通过创建b这个临时变量，我们告诉编译器，g的调用不会改变t的值。
+
+另一个阻止编译器进行优化的情况是混叠的发生，比如：
+
+```c++
+void init(char* a, char* b, size_t N) {
+    std::memset(a, '0', N);
+    std::memset(b, '1', N);
+}
+```
+
+编译器不会优化，因为编译器必须考虑a跟b是否指向同一个数组，或一个数组部分是否有重叠的可能性。编译器只关心一个问题，如何不改变代码的行为。同样的问题也发生在通过指针或引用接收多个形参的函数中：
+
+```c++
+void do_work(int& a, int& b, int& x) {
+    if (x < 0) x = -x;
+    a += x;
+    b += x;
+}
+```
+
+编译器会考虑是否有别名的存在，必须在a递增后从内存中读取x，防止自己假设x保持不变，因为a和x可能指向相同的值。如果确定不会发生混叠，可以使用C中的关键字restrict，告诉编译器一个特定的指针是访问当前函数范围内的唯一方法：
+
+```c++
+void init(char* restrict a, char* restrict b, size_t N);
+```
+
+对于奇异值（特别是引用）创建一个临时变量可以解决如下问题：
+
+```c++
+void do_work(int& a, int& b, int& x) {
+    if (x < 0) x = -x;
+    const int y = x;
+    a += y;
+    b += y;
+}
+```
+
+以下是一个将运行时值转换为编译时值的例子：
+
+```c++
+//优化前
+enum op_t { do_shrink, do_grow };
+void process(std::vector<Shape>& v, op_t op) {
+    for (Shape& s : v) {
+        if (op == do_shrink) s.shrink();
+        else s.grow();
+    }
+}
+
+//优化后
+template <op_t op>
+void process(std::vector<Shape>& v) {
+    for (Shape& s : v) {
+        if (op == do_shrink) s.shrink();
+        else s.grow();
+    }
+}
+void process(std::vector<Shape>& v, op_t op) {
+    if (op == do_shrink) process<do_shrink>(v);
+    else process<do_grow>(v);
+}
+
+```
+
+## 未定义的行为和性能
+
+### 未定义行为
+
+标准中说明如果行为没有定义，则标准对结果没有任何要求。
+
+### 未定义的行为和C++优化
+
+通过假设程序中的循环最终都会结束，编译器能够优化某些循环和包含这些循环的代码。优化器使用的逻辑都相同：首先假设程序不显示UB（未定义的行为），然后推导出必须为真的条件，使这个假设成立，并假设这些条件确实总是为真，最后，在这种假设下有效的优化都可以进行。
+
+如果想使用const来进行优化，则：
+
+- 如果值不改变，将其声明为const；
+- 更好的优化是如果该值在编译时已知，将其声明为constexpr；
+- 通过const引用传递形参给函数没有任何优化作用；
+- 对于小类型，按值传递比按引用传递更有效；
+
+### 使用未定义的行为进行高效的设计
+
+文中举得例子可以分为两种，一种是像++k + k表达式这样的代码是错误的，因为其根本没有定义行为，第二种是像k+1这样的代码，其中k是有符号的整数，如果溢出结果是未定义的。也就是说，代码具有隐式的先决条件。即，如果输入符合某些限制，则保证结果是正确的，并且程序以一种定义良好的方式运行。
+
+编译器有选项来启动UB杀灭器（UBSan）来找出UB。对于Clang和GCC，选项为：
+
+```shell
+clang++ --std=c++17 –O3 –fsanitize=undefined ub.C
+```
+
+## 为性能而设计
+
+### 为性能设计
+
+最小信息原则，即极可能少的交互信息，上下文在这里非常重要，建议组件尽可能少的暴露它如何处理特定请求的信息。在此类接口或交互中，作出和履行承诺的一方不应该提供额外的信息。即接口不应该暴露实现。
+
+最大信息原则，不同于完成请求的组件应该避免暴露可能限制实现的信息，对发出请求的组件应该能够提供关于具体需要什么的特定信息。
+
+### API的设计考虑
+
+设计高效并发API的指导原则：
+
+- 用于并发使用的接口应该是事务性的；
+- 接口应该提供最小的必要线程安全保证；
+- 对于既用作客户端可见API，又用作创建自己的、更复杂的事务，需要提供锁的高级组件构建块接口，通常有两个版本，一个具有强线程安全保证，另一个具有弱线程安全保证；
