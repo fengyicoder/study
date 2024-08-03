@@ -190,7 +190,7 @@ g++ test.cpp -g -O3 -mavx2 -masm=intel -S -o - | llvm-mca -mcpu=btver2 -timeline
 
 ### 流水线和分支
 
-流水线也有前提条件：为了从循环迭代中交叉执行代码，必须知道将要执行什么代码。因此，条件执行或分支也是流水线的障碍。
+流水线也有前提条件：为了从循环迭代中交叉执行代码，必须知道将要执行什么代码。因此，条件执行或分支也是流水线的障碍。一般来说Bad Speculation指标在百分之五到十的范围内是正常的，一旦超过百分之十就需要关注。
 
 ### 投机执行
 
@@ -274,6 +274,15 @@ for (size_t i = 0; i < N; ++i) {
 
 因为函数调用本身就破坏了流水。如果必须基于一个条件从多个函数中进行选择，函数指针表比链式if-else语句更有效。
 
+### 优化计算
+
+当应用TMA方法时，低效计算通常反应在Core Bound类别中，以及一定程度上反应在Retiring类别中。Core Bound类别代表CPU乱序执行引擎内所有非内存问题引起的停顿，主要包括两个类别：
+
+- 软件指令之间的数据依赖性；
+- 硬件计算资源短缺；
+
+内联可以消除调用函数的开销，如果确实有必要内联，对于 GCC 和 Clang 编译器，可以使用 C++11 的 `[[gnu::always_inline]]` 属性作为内联 `foo` 的提示，如下面的代码示例所示。对于较早的 C++ 标准，可以使用 `__attribute__((always_inline))`。对于 MSVC 编译器，可以使用 `__forceinline` 关键字。
+
 ## 内存架构和性能
 
 ### 测试访问内存速度
@@ -308,6 +317,8 @@ void BM_read_seq(benchmark::State& state) {
 
 ```
 
+在TMA方法论中，Memory Bound估算了由于加载或存储指令的需求导致CPU管道可能停滞的插槽的比例，因此，需要找到导致高Memory Bound指标的内存访问。而`前端瓶颈(Front-End Bound)` 指标捕捉 FE 性能问题。它代表了 CPU FE 无法向 BE 提供指令的周期百分比，而它本可以接受它们。大多数实际应用程序都会经历非零的`Front-End Bound`指标，这意味着一定百分比的运行时间将因次优的指令获取和解码而损失。低于10%是常态。如果你看到"Front-End Bound"指标超过20%，那么绝对值得花时间解决它。
+
 ### 内存速度：数字
 
 通过运行基准测试，发现数据量与读取速度成反比，32kb的L1缓存速度很快，数据量都能装入L1缓存，读取速度就不依赖数据量，超过32kb数据，读取速度就开始下降，数据现在适合L2缓存，它更大，但速度更慢，依次类推，直到数据大小超过8M，开始真正从主存读取数据。
@@ -329,6 +340,70 @@ $ perf stat -e \
 cycles,instructions,L1-dcache-load-misses,L1-dcache-loads \
 ./program
 ```
+
+如果性能瓶颈出现在来回传输的内存，还可以尝试压缩来使得内存更紧凑，比如：
+
+```c++
+struct S {
+  unsigned a:4;
+  unsigned b:2;
+  unsigned c:2;
+}; // S is only 1 byte
+```
+
+而且将结构体的成员按其大小进行声明可以减小其大小：
+
+```c++
+struct S1 {
+  bool b;
+  int i;
+  short s;
+}; // S1 is `sizeof(int) * 3` bytes
+
+struct S2 {
+  int i;
+  short s;  
+  bool b;
+}; // S2 is `sizeof(int) * 2` bytes
+```
+
+为了避免使用多个缓存行，还可以利用alignas关键字进行缓存对齐。
+
+未能在缓存中解析的内存访问通常代价高昂，现代CPU有两种解决这个问题的机制：硬件预取和ooo执行。我们有时候可以使用显式软件预取来避免缓存未命中，比如使用gcc的\_\_builtin_prefetch，x86平台利用显式软件预取的另一种选择是编译器内部函数\_mm_prefetch。
+
+减少DTLB未命中可以使用大页面，主要有以下几种。显式大页面（EHP），是系统内存的一部分，作为大页面文件系统hugetlbfs暴露，应在启动时或运行时预留，比如：
+
+```c++
+void ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+if (ptr == MAP_FAILED)
+  throw std::bad_alloc{};                
+...
+munmap(ptr, size);
+```
+
+透明大页面(THP)又有两种操作模式，系统范围和每个进程。启用系统范围的THP，将自动将大页面用于常规内存分配，无需程序明确要求。使用每个进程选项时，实例如下：
+
+```c++
+void ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1 , 0);
+if (ptr == MAP_FAILED)
+  throw std::bad_alloc{};
+madvise(ptr, size, MADV_HUGEPAGE);
+// use the memory region `ptr`
+munmap(ptr, size);
+```
+
+改善基本块布局，举例：
+
+```c++
+// 热路径
+if (cond) [[unlikely]]
+  coldFunc();
+// 再次热路径
+```
+
+在上面代码中，`[[unlikely]]` 提示将指示编译器 `cond` 不太可能为真，因此编译器应相应地调整代码布局。在 C++20 之前，开发人员可以使用 `__builtin_expect`:
 
 ### 机器里的幽灵
 
