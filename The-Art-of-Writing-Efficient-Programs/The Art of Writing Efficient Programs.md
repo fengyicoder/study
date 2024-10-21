@@ -90,7 +90,47 @@ perf list
 perf stat -e cycles,instructions,branchs ./example
 ```
 
-使用perf进行收据收集，必须使用调试信息进行编译，并使用perf record -g(记录符号信息)命令运行分析器。也可以指定计数器或一组计数器，但可以指定采样频率。收集完信息后可以使用perf report将收集的数据可视化。
+使用perf进行收据收集，必须使用调试信息进行编译，并使用perf record -g(记录符号信息)命令运行分析器。perf可以使用三种方式收集调用堆栈，第一种栈指针，perf record --call-graph fp，要求使用--fnoomit-frame-pointer构建二进制文件，第二种DWARF调试信息，perf record --call-graph dwarf，要求-g构建二进制，第三种使用英特尔最后分支记录硬件功能，perf record --call-graph lbr，通过解析LBR堆栈获取调用堆栈。可以指定计数器或一组计数器，也可以指定采样频率。收集完信息后可以使用perf report将收集的数据可视化。通过instructions/cycles，可以得到IPC（每周期指令数，越高越好）；通过指定事件，uops_issued.any,uops_executed.thread,uops_retired.slots，可以查看微操作的数量，通常，用于一条指令的微操作越少越好，意味着硬件对其支持越好，并且可能具有更低的延迟和更高的吞吐。事件ref-cycles统计的周期数指的是没有频繁缩放的情况下；指定事件mem_load_retired.fb_hit,mem_load_retired.l1_miss,
+  mem_load_retired.l1_hit,mem_inst_retired.all_loads收集L1缓存失效的数量，加载操作可能命中已分配的填充缓冲区（fb_hit），或者命中L1缓存（l1_hit），或者两者都未命中（l1_miss），因此 all_loads = fb_hit + l1_hit + l1_miss，还可进一步分析L1数据缺失L2缓存行为， perf stat -e mem_load_retired.l1_miss,
+  mem_load_retired.l2_hit,mem_load_retired.l2_miss -- a.exe；通过事件branches,branch-misses来检查分支预测错误的数量；以上的事件只是常用性能计数器的映射，还可以通过指定Event和Umask十六进制值来访问它们，例如$ perf stat -e cpu/event=0xc4,umask=0x0,name=BR_INST_RETIRED.ALL_BRANCHES/ -- ./a.exe;
+
+对于这行命令，perf stat --topdown -a -- taskset -c 0 ./benchmark.exe，perf stat命令中--topdown选项用来打印TMA第一级指标，即“前端受限”、“后端受限”、“退休”、“错误猜测”，-a用于分析整个系统，taskset -c 0将基准测试固定在核心0上。由于其只支持一级TMA指标，要访问2、3以及更高级，可以使用toplev工具（pmu-tools的一部分），要使用toplev需要启用特定的linux内核设置。~/pmu-tools/toplev.py --core S0-C0 -l2 -v --no-desc taskset -c 0 ./benchmark.exe，-l2告诉工具收集level 2指标，--no-desc禁用每个指标描述。找到了热点事件就可以利用perf进行事件采样找到代码位置。从zen4开始，AMD也支持一级二级TMA分析，它被称为管道利用率分析，比如perf stat -M PipelineL1,PipelineL2 -- ./cryptest.exe b1 10，或者在单个运行中收集一组指标，perf stat -M frontend_bound,backend_bound；
+
+perf采样数据，示例：perf record -o ./perf.data --call-graph dwarf,8192 --event cycles --aio --sample-cpu --pid 874174。对于arm处理器，还可以使用arm工程师开发的topdown-tool: https://learn.arm.com/install-guides/topdown-tool/2 这个工具，比如 topdown-tool --all-cpus -m Topdown_L1 -- python -c "from ai_benchmark import AIBenchmark; results = AIBenchmark(use_CPU=True).run()"，其中 --all-cpus 选项启用所有 CPU 的系统级收集，而 -m Topdown_L1 则收集 Topdown 1 级指标。 -- 后面的所有内容都是运行 AI Benchmark Alpha 套件的命令行。
+
+在intel平台，如果需要堆栈数据可以使用perf record -b -e cycles ./benchmark.exe，虽然perf record --call-graph lbr也可，但信息量比前者少，不会收集分支预测和周期数据。用户可以导出原始LBR堆栈自定义分析，
+
+perf script -F brstack &> dump.txt。从 Linux 内核 6.1 开始，Linux “perf” 在 AMD Zen4 处理器上支持分支分析用例，除非另有明确说明。Linux perf 命令收集 AMD LBR 使用相同的 -b 和 -j 选项。示例： perf record --call-graph lbr -- ./a.exe；perf report -n --stdio
+
+    99.96%  99.94%    65447    a.exe    a.exe  [.] bar
+            |          
+             --99.94%--main
+                       |          
+                       |--90.86%--foo
+                       |          |          
+                       |           --90.86%--bar
+                       |          
+                        --9.08%--zoo
+                                  bar
+
+查看热门分支的预测错误率：perf record -e cycles -b -- ./7zip.exe b；perf report -n --sort symbol_from,symbol_to -F +mispredict,srcline_from,srcline_to --stdio
+
+    46.12%   303391   N   dec.c:36   dec.c:40  LzmaDec     LzmaDec   
+    22.33%   146900   N   enc.c:25   enc.c:26  LzmaFind    LzmaFind  
+     6.70%    44074   N   lz.c:13    lz.c:27   LzmaEnc     LzmaEnc   
+     6.33%    41665   Y   dec.c:36   dec.c:40  LzmaDec     LzmaDec
+
+性能分析工具，除了perf之外，intel平台可以使用Vtune，AMD使用uProf，Apple使用Instruments。
+
+如果想要查看精确事件，可使用pp，如$ perf record -e cycles:pp -- ./a.exe
+
+perf如果需要生成火焰图，需要下载FlameGraph工具，首先采样数据sudo perf record -F 99 -p PID -g -- sleep 30或者sudo perf record -g ./main2，之后将采集到的数据转化为火焰图需要的中间格式sudo perf script > out.perf
+或
+sudo perf script -i perf.data> out.perf，之后生成火焰图./stackcollapse-perf.pl < ../out.perf | ./flamegraph.pl > out.svg。
+
+如果想要分析特定的代码，可以使用专业的性能分析器，比如Tracy。
+
+有些时候，还可能需要持续性能分析，一种始终处于系统级、基于采样的性能分析器，但采样率较低，以尽量减少运行时影响，此时可以使用parca。
 
 谷歌的分析器需要链接profiler库，各选项通过环境变量控制。
 
