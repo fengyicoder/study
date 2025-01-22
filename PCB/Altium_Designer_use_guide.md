@@ -86,7 +86,7 @@ PCB封装库的检查：报告->元件规则检查
 
 类的创建：设计->类
 
-常用规则：设计->规则，间距一般最小6mil，布线线宽最小6mil，电源线12mil到60mil之间，走线状态下shif+w可以选择线宽；过孔12mil，过孔直径22mil，阻焊soldermaskexpansion设为2.5mil，planeconnect一般外扩20mil，空间间隙10mil，planeClearance间距设为8mil，对于铜皮的连接，如果是通孔焊盘连接，一般是花焊盘连接，这样散热均匀且不易虚焊，表贴焊盘也是默认花焊盘，某些电源网络如果需要增大电流可以选择全连接，过孔的连接一般是全连接，宽度都是10mil；HoleToHoleClearance为10mil，SilkToSolderMaskClearance为6mil，SilkToSilkClearance为6mil；
+常用规则：设计->规则，间距一般最小6mil，布线线宽最小6mil，电源线12mil到60mil之间，走线状态下shif+w可以选择线宽；过孔8，10，12都可，这里选择12mil，过孔直径22mil，阻焊soldermaskexpansion设为2.5mil，planeconnect一般外扩20mil，空间间隙10mil，planeClearance间距设为8mil，对于铜皮的连接，如果是通孔焊盘连接，一般是花焊盘连接，这样散热均匀且不易虚焊，表贴焊盘也是默认花焊盘，某些电源网络如果需要增大电流可以选择全连接，过孔的连接一般是全连接，宽度都是10mil；HoleToHoleClearance为10mil，SilkToSolderMaskClearance为6mil，SilkToSilkClearance为6mil；
 
 设置区域规则：设计->Room->放置矩形Room，之后在规则那里选择自定义，输入WithinRoom设置规则。
 
@@ -113,3 +113,5 @@ PCB尺寸标注：放置->尺寸->线性尺寸
 输出pdf：文件->智能pdf
 
 gerb文件：文件->制造输出->gerb文件，钻孔输出，制造输出->NC Drill Files，IPC网表输出，制造输出->Test Point Report，贴片坐标图，装配输出->Generate Point and place files
+
+差分规则：首先需要找到PCB面板，然后选择差分编辑器，创建差分类别之后添加位号，之后设计->规则，在Routing里选择DiffPairRouting，按照阻抗匹配设置线宽与间距。
