@@ -834,3 +834,148 @@ priotity是级别和设施的结合。
 2. 在select上阻塞等待I/O；
 3. 使用较新的SO_RCVTIMEO和SO_SNDTIMEO套接字选项；
 
+## recv和send函数
+
+```c
+#include <sys/uio.h>
+ssize_t recv(int sockfd, void *buff, size_t nbytes, int flags);
+ssize_t send(int sockfd, const void *buff, size_t nbytes, int flags);
+//成功为读入或写出的字节数，否则为-1
+```
+
+flags参数的值要么为0，要么为以下值：
+
+- MSG_DONTROUTE：告知内核目的主机在某个直接连接的本地网络上，无需执行路由表查找；
+- MSG_DONTWAIT：在无需打开相应套接字阻塞标志的前提下，把单个I/O操作临时指定为非阻塞，接着执行I/O操作，然后关闭非阻塞标志。
+- MSG_OOB：对于send，指明即将发送带外数据，对于recv，指明即将读入带外数据；
+- MSG_PEEK：适用于recv和recvfrom，允许我们查看已可读取的数据，而且系统不在recv或recvfrom返回后丢弃这些数据；
+- MSG_WAITALL：告知内核不要在尚未读取请求数目的字节之前让一个读操作返回。
+
+## readv和writev函数
+
+readv和writev允许单个系统调用读入或写出自一个或多个缓冲区。
+
+```c
+#include <sys/uio.h>
+ssize_t readv(int filedes, const struct iovec *iov, int iovcnt);
+ssize_t writev(int filedes, const struct iovec *iov, int iovcnt);
+//成功为读入或写出的字节数，否则为-1
+```
+
+## recvmsg和sendmsg函数
+
+这两个函数是最通用的I/O函数，实际上可以将所有read、readv和recvfrom替换为recvmsg，各种输出函数调用也可替换成sendmsg调用。
+
+```c
+#include <sys/socket.h>
+ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
+ssize_t sendmsg(int sockfd, struct msghdr *msg, int flags);
+//成为为读入或写出的字节数，否则为-1
+```
+
+## 排队的数据量
+
+如果想要在不真正读取数据的前提下知道一个套接字上已经有多少数据排队等着读取，有三种技术：
+
+1. 如果获悉已排对数据量的目的在于避免读操作阻塞在内核中，那么可以使用非阻塞式I/O；
+2. 如果我们既想要查看数据，又想数据仍然留在接收队列中以供本进程其他部分稍后读取，可以使用MSG_PEEK标志。
+3. 一些实现支持ioctl的FIONREAD命令。
+
+## 套接字和标准I/O
+
+标准I/O函数库可用于套接字，不过需要考虑以下几点：
+
+- 通过调用fdopen，可以从任何一个描述符创建出一个标准I/O流。类似，通过调用fileno，可以获取一个给定标准I/O流对应的描述符；
+- TCP和UDP套接字是全双工的，标准I/O流也可以是全双工的：只要以r+类型打开流即可，然而在这样的流上，我们必须在调用一个输出函数之后插入一个fflush、fseek、fsetpos或rewind调用才能接着调用一个输入函数。类似，调用一个输入后也必须插入一个fseek、fsetpos或rewind调用才能调用一个输出函数，除非输出函数遇到一个EOF。fseek、fsetpos和rewind这三个函数的问题是它们都调用lseek，而lseek用在套接字上只会失败；
+- 解决上述读写问题最简单的方法是为一个套接字打开两个标准I/O流：一个用来读一个用来写；
+
+标准I/O函数库执行以下三类缓冲：
+
+- 完全缓冲：意味只有以下情况时才会发生I/O，缓冲区满，进程显式调用fflush或者进程调用exit终止自身。标准I/O缓冲区大小通常为8192字节；
+- 行缓冲：只有以下情况才会I/O，碰到一个换行符，进程调用fflush或进程调用exit终止自身；
+- 不缓冲：每次调用标准I/O输出函数都发生I/O；
+
+标准I/O函数库的大多数Unix实现使用以下规则：
+
+- 标准错误输出总是不缓冲；
+- 标准输入和标准输出完全缓冲，除非它们是终端设备（这种情况它们行缓冲）；
+- 所有其他I/O流都是完全缓冲，除非它们是终端设备（这种情况行缓冲）；
+
+书中提到的问题有两个解决方法，一个是调用setvbuf迫使输出流变为行缓冲，第二个是每次调用fputs之后调用fflush强制输出。然而在现实使用中，这两种方法都容易犯错，与Nagle算法的交互也可能成问题，因此最好不要在套接字上使用标准I/O函数库。
+
+# Unix域协议
+
+## 概述
+
+Unix域协议不是一个实际的协议族，而是在单个主机上执行客户/服务器通信的一种方法。Unix域提供两类套接字：字节流套接字和数据报套接字。使用Unix域套接字有以下三个理由：
+
+1. 在源自Berkeley的实现中，Unix域套接字往往比通信两端位于同一个主机的TCP套接字快出一倍；
+2. Unix域套接字可用于在同一个主机上的不同进程之间传递描述符；
+3. Unix域套接字较新的实现把客户的凭证提供给服务器，从而能够提供额外的安全检查；
+
+## socketpaire函数
+
+此函数创建两个随后连接起来的套接字，且本函数仅适用于Unix域套接字。
+
+```c
+#include <sys/socket.h>
+int socketpair(int family, int type, int protocol, int sockfd[2]);
+//成功返回0，否则为-1
+```
+
+family参数必须为AF_LOCAL，protocol参数必须为0，type参数既可以是SOCK_STREAM，也可以是SOCK_DGRAM，新创建的两个套接字描述符作为sockfd[0]和sockfd[1]返回。
+
+指定type参数为SOCK_STREAM调用socketpair得到的结果称为流管道，它与调用pipe创建的普通Unix管道类似，差别在于流管道是全双工的。
+
+## 套接字函数
+
+当用于Unix域套接字时，套接字函数存在一些差异和限制，下列列出POSIX的要求，并且并非所有实现目前都已达到这个级别：
+
+1. 由bind创建的路径名默认访问权限应为0777，并按照当前umask值进行修正；
+2. 与Unix套接字关联的路径名应该是一个绝对路径名；
+3. 在connect调用中指定的路径名必须是一个当前绑定在某个打开的Unix域套接字上的路径名，而且它们的套接字类型也必须一致；
+4. 调用connect连接一个Unix域套接字涉及的权限测试等同于调用open以只写方式访问相应的路径名；
+5. Unix域字节流套接字类似TCP套接字，它们都为进程提供一个无记录边界的字节流接口；
+6. 如果对于某个Unix域字节流套接字的connect调用发现这个监听套接字的队列已满，调用就立即返回一个ECONNREFUSED错误，这一点不同于TCP：如果TCP监听套接字的队列已满，TCP监听端就忽略新到达的SYN，而TCP连接发起端将数次发送SYN进行重试；
+7. UNIX域数据报套接字类似UDP套接字：它们都提供一个保留记录边界的不可靠数据报服务；
+8. 在一个未绑定的Unix域套接字上发送数据报不会自动给这个套接字捆绑一个路径名，这一点不同于UDP套接字：在一个未绑定的UDP套接字上发送UDP数据报导致给这个套接字捆绑一个临时端口。
+
+## 描述符传递
+
+当考虑从一个进程到另一个进程传递打开的描述符时，我们通常会想到：
+
+- fork调用返回之后，子进程共享父进程所有打开的描述符；
+- exec调用执行后，所有描述符通常保持打开状态不变；
+
+如果想要在任意两个进程间传递一个打开的描述符，首先需要在这两个进程之间创建一个Unix域套接字，然后使用sendmsg跨这个套接字发送一个特殊消息：
+
+1. 创建一个字节流或数据报的Unix域套接字，如果目标是fork一个进程，让子进程打开待传递的描述符再回传到父进程，那么父进程可以预先调用socketpair创建一个可用于父子进程之间交换描述符的流管道。如果进程之间没有亲缘关系，那么服务器进程必须创建一个Unix域字节流套接字，bind一个路径名到该套接字以允许客户进程connect到该套接字。
+2. 发送进程通过调用返回描述符的任意Unix函数打开一个描述符，这些函数的例子有open、pipe、mkfifo、socket和accept，可以在进程之间传递的描述符不限制类型；
+3. 发送进程创建一个msghdr结构，其中含有待传递的描述符，发送进程通过sendmsg来发送描述符。即使发送进程在调用sendmsg之后但在接收进程调用recvmsg之前关闭了该描述符，对于接收进程它仍然处于打开状态，发送一个描述符会使得该描述符的引用计数+1。
+4. 接收进程调用recvmsg在Unix套接字上接收这个描述符。传递一个描述符并不是传递一个描述符，而是在接收进程创建一个新的描述符。
+
+在调用resvmsg中应该避免使用MSG_PEEK标志，否则后果不可预料。
+
+# 非阻塞I/O
+
+## 概述
+
+可能阻塞的套接字调用可分为以下四类：
+
+1. 输入操作，包括read、readv、recv、recvfrom和recvmsg，如果某个进程对一个阻塞的TCP套接字调用这些输入函数之一，而且该套接字的接收缓冲区中没有数据可读，该进程将被投入睡眠，直到有一些数据到达。
+2. 输出操作，包括write、writev、send、sendto和sendmsg，对于阻塞套接字，如果其发送缓冲区没有空间该进程将被投入睡眠。对于一个非阻塞的TCP套接字，如果其发送缓冲区根本没有空间，输出函数将立即返回一个EWOULDBLOCK错误，如果有一些空间，返回值将是能够复制到该缓冲区的字节数。
+3. 接收外来连接，即accept，如果对一个阻塞的套接字调用accept并且尚无新连接到达，调用进程将被投入睡眠。对一个非阻塞的套接字调用accept并且尚无新连接到达，accept调用将立即返回一个EWOULDBLOCK错误；
+4. 发起外出连接，即connect函数。对一个阻塞的TCP套接字调用connect，并且连接不能立即建立，其总会阻塞其调用进程至少一个到服务器的RTT时间，如果对一个非阻塞的TCP套接字调用connect，并且连接不能立即建立，连接照样能发起，但会返回一个EINPROGERESS错误。
+
+# ioctl操作
+
+## ioctl函数
+
+```c
+#include <unistd.h>
+int ioctl(int fd, int request, .../* void *arg */); //成功返回0，否则为-1
+```
+
+以下是网络相关ioctl请求的request参数以及arg地址必须指向的数据类型：
+
+![](..\image\Unix\1-17-1.png)
