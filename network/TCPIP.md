@@ -979,9 +979,10 @@ epoll_create的api如下：
 ```c++
 #include <sys/epoll.h>
 int epoll_create(int size);
+int epoll_create1(int flags);
 ```
 
-调用此函数创建的文件描述符保存空间称为epoll例程，通过size参数来决定epoll例程的大小。epoll_create创建的资源与套接字相同，也由操作系统管理，也会返回文件描述符，因此终止时也需要close函数。
+调用此函数创建的文件描述符保存空间称为epoll例程，通过size参数来决定epoll例程的大小。epoll_create创建的资源与套接字相同，也由操作系统管理，也会返回文件描述符，因此终止时也需要close函数。注意epoll_create已被废弃。flags控制 epoll 文件描述符行为的标志，为0无特殊行为，为EPOLL_CLOEXEC则设置返回的文件描述符具有 `FD_CLOEXEC` 属性（即 `exec()` 后自动关闭）。
 
 生成epoll例程后需要注册需要监视对象文件描述符，api如下：
 
