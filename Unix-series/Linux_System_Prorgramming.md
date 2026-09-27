@@ -1251,3 +1251,58 @@ int setitimer (int which,
 可以使用timer_gettime获取一个定时器的过期时间而不重新设置它。
 
 POSIX中的接口timer_getoverrun可以来确定一个给定定时器目前的超时值。
+
+# 其他
+
+## memfd_create
+
+创建一个匿名、纯内存的文件，返回一个文件描述符：
+
+```c
+#include <sys/mman.h>
+
+int memfd_create(const char *name, unsigned int flags);
+```
+
+- 不挂在任何真实的文件系统路径上（不像 `/tmp/xxx` 那样能在文件系统里被 `ls` 出来找到路径）
+- 数据完全存在于内存（基于 `tmpfs` 机制实现，属于匿名共享内存的一种）
+- 拥有和普通文件一样的操作接口：可以 `read`/`write`/`mmap`/`ftruncate`/`lseek`
+
+常用标志：
+
+- **`MFD_CLOEXEC`**：设置 close-on-exec 标志，`execve` 时自动关闭这个 fd，避免意外泄漏给子进程执行的新程序（这是安全最佳实践，几乎总应该加上）
+- **`MFD_ALLOW_SEALING`**：允许后续对这个 fd 使用 "sealing"（密封）机制
+
+核心特性：文件密封，独有的安全机制。
+
+```c
+#include <linux/memfd.h>
+
+int fd = memfd_create("sealed_buf", MFD_ALLOW_SEALING);
+ftruncate(fd, 4096);
+// ... 写入数据 ...
+
+// 密封：之后不允许再缩小或增大这个文件的大小
+fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW);
+
+// 密封：之后不允许再修改内容（变成只读，即使原本有写权限）
+fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE);
+
+// 密封：禁止再添加新的seal（"封印这个封印能力本身"）
+fcntl(fd, F_ADD_SEALS, F_SEAL_SEAL);
+```
+
+**为什么这个特性很重要**：假设进程 A 创建了一块内存，写好数据后把 fd 传给不受信任的进程 B（比如一个沙箱里的渲染进程，Chrome/Electron 类应用常用这个模式）。如果不加密封，进程 B 拿到这个 fd 后依然可以修改这块内存的内容，或者用 `ftruncate` 把它改变大小，可能导致进程 A 这边读取时出现越界或者数据被恶意篡改。加上 `F_SEAL_WRITE` 之后，即使进程 B 拿到了这个 fd 也无法修改内容，只能读——这是一种**"一次写入，多次只读分发"**的安全共享模式，常用于沙箱隔离架构（Chromium 的 Zygote 进程模型就大量用到这个机制）。
+
+**fd 传递技术（SCM_RIGHTS）—— 配合 memfd 分享给"无关系进程"的关键**
+
+`memfd_create` 创建的 fd 默认只在**当前进程**（以及它 `fork` 出来的子进程，因为子进程会继承父进程的 fd 表）里有效。如果你想把这块内存分享给一个**完全无关系、独立启动的进程**（比如通过 Unix Socket 连接上来的客户端），普通手段是做不到的——fd 本质上只是"当前进程fd表里的一个索引数字"，脱离了进程上下文这个数字毫无意义。
+
+**Unix Domain Socket 提供了一种特殊机制，可以把 fd 这个"索引"连带它背后指向的内核对象，一起"过户"给另一个进程**，这就是 `SCM_RIGHTS`（辅助数据类型之一，全称 Socket Control Message - Rights）。
+
+Unix Domain Socket 支持通过 `sendmsg`/`recvmsg` 发送**辅助数据（ancillary data / control message）**，其中 `SCM_RIGHTS` 类型的辅助数据专门用来传递文件描述符。内核在接收端会：
+
+1. 拿到发送方传过来的 fd 所指向的**内核对象**（不是简单复制数字，而是让内核对象的引用计数+1）
+2. 在接收进程的 fd 表里**分配一个新的数字**（可能和发送方的数字完全不同）指向同一个内核对象
+
+也就是说，传递后**两个进程的 fd 数值可能不一样，但指向同一份底层资源**（同一个打开的文件/同一块 memfd 内存）。
